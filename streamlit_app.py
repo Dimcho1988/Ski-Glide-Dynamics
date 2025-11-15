@@ -5,7 +5,7 @@ import xml.etree.ElementTree as ET
 import numpy as np
 import pandas as pd
 import streamlit as st
-import altair as alt  # НОВО
+import altair as alt  # за визуализация
 
 G = 9.81  # gravitational acceleration m/s^2
 
@@ -325,18 +325,21 @@ def main():
     else:
         mu_ref = mu_ref_fixed
 
-    # прилагаме модулацията
+    # прилагаме модулацията към всички дейности
     for name, obj in activities.items():
         df = obj["df"]
         mu_eff = obj["mu_eff"]
         df_mod = modulate_speed(df, mu_eff=mu_eff, mu_ref=mu_ref)
         activities[name]["df"] = df_mod
 
+    # изчисляваме средните модулирани скорости за таблицата (от df_mod)
+    mod_speeds = []
+    for name in summary_df["Файл"]:
+        df_mod = activities[name]["df"]
         avg_speed_mod = df_mod["speed_mod_m_s"].mean() * 3.6
-        summary_df.loc[
-            summary_df["Файл"] == name,
-            "Средна скорост (модулирана) km/h",
-        ] = avg_speed_mod
+        mod_speeds.append(avg_speed_mod)
+
+    summary_df["Средна скорост (модулирана) km/h"] = mod_speeds
 
     st.subheader("Обобщение по активности")
     st.dataframe(summary_df.style.format(precision=3))
@@ -370,23 +373,21 @@ def main():
     if plot_df.empty:
         st.warning("Няма достатъчно валидни данни за визуализация.")
     else:
-        # Altair: две линии + легенда
         chart = (
             alt.Chart(plot_df)
             .transform_fold(
                 ["Скорост реална [km/h]", "Скорост модулирана [km/h]"],
-                as_=["Вид", "Скорост"],
+                as_=["Тип скорост", "Скорост"],
             )
             .mark_line()
             .encode(
                 x=alt.X("Време [мин]:Q", title="Време [мин]"),
                 y=alt.Y("Скорост:Q", title="Скорост [km/h]"),
-                color=alt.Color("Вид:N", title="Тип скорост"),
-                tooltip=["Време [мин]:Q", "Вид:N", "Скорост:Q"],
+                color=alt.Color("Тип скорост:N", title="Тип скорост"),
+                tooltip=["Време [мин]:Q", "Тип скорост:N", "Скорост:Q"],
             )
             .properties(height=350)
         )
-
         st.altair_chart(chart, use_container_width=True)
 
     st.caption(
