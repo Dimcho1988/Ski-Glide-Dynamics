@@ -144,69 +144,68 @@ def compute_slopes(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def estimate_mu_eff(df: pd.DataFrame) -> float:
+def estimate_mu_eff(
+    df: pd.DataFrame,
+    a_threshold: float = 0.2,
+    slope_min: float = -8.0,
+    slope_max: float = -1.0,
+    v_min: float = 1.5,
+    v_max: float = 12.0,
+):
     """
-    Оценка на ефективния коефициент на триене µ_eff за цялата активност.
-    - гледаме само спускания (slope <= -5%)
-    - игнорираме първите 5 s на всяко спускане
-    Формула: mu ≈ -(a + g sinθ) / (g cosθ)
+    НОВА оценка на ефективния коефициент на триене µ_eff за цялата активност.
+
+    Идея:
+    - гледаме само почти стационарни точки: |a| <= a_threshold
+    - и само умерени спускания: slope_pct в [slope_min, slope_max] (напр. -8% до -1%)
+    - и само разумни скорости: v в [v_min, v_max]
+
+    Формула:
+        a = g sinθ - μ g cosθ  =>  μ = (g sinθ - a) / (g cosθ)
+
+    Връща:
+        (mu_eff, n_points)  – медианата и броя използвани точки
     """
     df = df.copy()
 
-    # изглаждаме скоростта за ускорението
+    # сглаждаме скорост за производна
     df["speed_smooth"] = smooth_series(df["speed_m_s"], window_sec=10, dt_series=df["dt"])
 
     # ускорение
     df["a"] = df["speed_smooth"].diff() / df["dt"]
     df["a"] = df["a"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
-    # маска за спускане
-    df["is_downhill"] = df["slope_pct"] <= -5.0
+    # филтри: наклон, скорост, малко ускорение
+    mask = (
+        (df["slope_pct"] >= slope_min)
+        & (df["slope_pct"] <= slope_max)
+        & (df["speed_smooth"] >= v_min)
+        & (df["speed_smooth"] <= v_max)
+        & (df["a"].abs() <= a_threshold)
+    )
 
-    # идентифицираме сегменти
-    seg_id = 0
-    seg_ids = []
-    prev_flag = False
-    for flag in df["is_downhill"]:
-        if flag and not prev_flag:
-            seg_id += 1
-        seg_ids.append(seg_id if flag else 0)
-        prev_flag = flag
-    df["seg_id"] = seg_ids
+    if not mask.any():
+        return np.nan, 0
 
-    use_mask = np.zeros(len(df), dtype=bool)
-    for sid in sorted(df["seg_id"].unique()):
-        if sid == 0:
-            continue
-        seg_idx = np.where(df["seg_id"].values == sid)[0]
-        if len(seg_idx) < 10:
-            continue  # минимум 10 s
-        seg_idx = seg_idx[5:]  # махаме първите 5 s
-        use_mask[seg_idx] = True
-
-    # допълнителни филтри
-    use_mask &= df["speed_smooth"].values > 1.0   # > 1 m/s
-    use_mask &= df["speed_smooth"].values < 15.0  # < 54 km/h
-
-    if not use_mask.any():
-        return np.nan
-
-    subset = df.loc[use_mask].copy()
+    subset = df.loc[mask].copy()
 
     subset["theta"] = np.arctan(subset["slope_dec"].values)
     sin_theta = np.sin(subset["theta"])
     cos_theta = np.cos(subset["theta"])
 
-    mu = -(subset["a"].values + G * sin_theta) / (G * cos_theta)
+    # μ = (g sinθ - a) / (g cosθ)
+    mu = (G * sin_theta - subset["a"].values) / (G * cos_theta)
 
     mu = np.where(np.isfinite(mu), mu, np.nan)
     mu = np.where((mu >= 0.001) & (mu <= 0.2), mu, np.nan)
 
     mu_clean = pd.Series(mu).dropna()
     if mu_clean.empty:
-        return np.nan
+        return np.nan, 0
 
-    return float(mu_clean.median())
+    mu_eff = float(mu_clean.median())
+    n_points = int(mu_clean.shape[0])
+    return mu_eff, n_points
 
 
 def modulate_speed(df: pd.DataFrame, mu_eff: float, mu_ref: float) -> pd.DataFrame:
@@ -232,7 +231,7 @@ def main():
         Това приложение:
 
         1. Зарежда **TCX** файлове от ски бягане / ролки.  
-        2. Оценява ефективен коефициент на триене **µ_eff** от спусканията.  
+        2. Оценява ефективен коефициент на триене **µ_eff** от почти стационарни спускания.  
         3. Модулира скоростта към избрана референтна плъзгаемост **µ_ref**.  
         4. Показва сравнение между **реална** и **модулирана** скорост.
         """
@@ -272,6 +271,13 @@ def main():
         step=5,
     )
 
+    # параметри за оценка на μ – можеш да ги експонираш и в sidebar при нужда
+    a_threshold = 0.2
+    slope_min = -8.0
+    slope_max = -1.0
+    v_min = 1.5
+    v_max = 12.0
+
     activities = {}
     summary_rows = []
 
@@ -286,8 +292,15 @@ def main():
                 window_sec=smooth_window_sec,
                 dt_series=df["dt"],
             )
-            mu_eff = estimate_mu_eff(df)
-            activities[f.name] = {"df": df, "mu_eff": mu_eff}
+            mu_eff, n_points = estimate_mu_eff(
+                df,
+                a_threshold=a_threshold,
+                slope_min=slope_min,
+                slope_max=slope_max,
+                v_min=v_min,
+                v_max=v_max,
+            )
+            activities[f.name] = {"df": df, "mu_eff": mu_eff, "n_mu": n_points}
 
             avg_speed = df["speed_m_s"].mean() * 3.6  # km/h
             summary_rows.append(
@@ -295,6 +308,7 @@ def main():
                     "Файл": f.name,
                     "Средна скорост (реална) km/h": avg_speed,
                     "µ_eff (оценена)": mu_eff,
+                    "Брой точки за µ": n_points,
                 }
             )
         except Exception as e:
@@ -325,16 +339,13 @@ def main():
         mu_ref = mu_ref_fixed
 
     # прилагаме модулацията към всички дейности
+    mod_speeds = []
     for name, obj in activities.items():
         df = obj["df"]
         mu_eff = obj["mu_eff"]
         df_mod = modulate_speed(df, mu_eff=mu_eff, mu_ref=mu_ref)
         activities[name]["df"] = df_mod
 
-    # изчисляваме средните модулирани скорости за таблицата
-    mod_speeds = []
-    for name in summary_df["Файл"]:
-        df_mod = activities[name]["df"]
         avg_speed_mod = df_mod["speed_mod_m_s"].mean() * 3.6
         mod_speeds.append(avg_speed_mod)
 
@@ -351,18 +362,20 @@ def main():
 
     df_sel = activities[selected_name]["df"]
     mu_eff_sel = activities[selected_name]["mu_eff"]
+    n_mu_sel = activities[selected_name]["n_mu"]
 
     st.markdown(
         f"""
         **{selected_name}**  
         - Оценена µ_eff: `{mu_eff_sel:.4f}`  
         - Използвана µ_ref: `{mu_ref:.4f}`  
+        - Брой точки за µ: `{n_mu_sel}`  
         """
     )
 
-    # малък debug – да видиш първите 10 реда
+    # debug – първи 10 реда
     st.write("Първи 10 реда за избраната активност:")
-    st.write(df_sel[["time_s", "speed_m_s", "speed_mod_m_s"]].head(10))
+    st.write(df_sel[["time_s", "speed_m_s", "speed_mod_m_s", "slope_pct"]].head(10))
 
     # данни за графика
     plot_df = pd.DataFrame(
@@ -378,7 +391,8 @@ def main():
 
     st.caption(
         "Модулираната скорост показва каква би била скоростта при същото усилие, "
-        "ако плъзгаемостта/триенето беше равна на избраната µ_ref."
+        "ако плъзгаемостта/триенето беше равна на избраната µ_ref. "
+        "µ_eff е оценена от точки с почти нулево ускорение на умерени спускания."
     )
 
 
