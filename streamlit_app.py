@@ -5,7 +5,7 @@ import xml.etree.ElementTree as ET
 import numpy as np
 import pandas as pd
 import streamlit as st
-
+import altair as alt  # НОВО
 
 G = 9.81  # gravitational acceleration m/s^2
 
@@ -64,7 +64,6 @@ def parse_tcx(file_obj) -> pd.DataFrame:
 
         # speed – може да е в Extensions; ако не, ще я смятаме от дистанцията
         speed = np.nan
-        # try typical Speed elements
         for tag in ["Speed", "ns3:Speed", "ns2:Speed"]:
             s_el = tp.find(f".//{{*}}{tag}")
             if s_el is not None and s_el.text is not None:
@@ -83,7 +82,6 @@ def parse_tcx(file_obj) -> pd.DataFrame:
     if df.empty:
         raise ValueError("Не бяха намерени валидни Trackpoint данни в TCX файла.")
 
-    # sort by time just in case
     df = df.sort_values("time").reset_index(drop=True)
 
     # relative time in seconds
@@ -92,27 +90,23 @@ def parse_tcx(file_obj) -> pd.DataFrame:
 
     # fill distance gaps if needed (monotonic increasing)
     if df["distance_m"].isna().all():
-        # integrate speed if available
         if df["speed_m_s"].notna().any():
             df["distance_m"] = (df["speed_m_s"].fillna(0) * df["dt"]).cumsum()
         else:
-            # ако няма нищо – просто индекси
             df["distance_m"] = np.arange(len(df))
     else:
-        # forward-fill distance и да е недекрементираща
         df["distance_m"] = df["distance_m"].fillna(method="ffill")
         df["distance_m"] = df["distance_m"].fillna(0)
         df["distance_m"] = np.maximum.accumulate(df["distance_m"].values)
 
     # compute speed from distance if missing or too many NaNs
     nan_ratio = df["speed_m_s"].isna().mean()
+    ddist = df["distance_m"].diff().fillna(0.0)
+    speed_from_dist = (ddist / df["dt"]).clip(lower=0.0)
+
     if nan_ratio > 0.2:
-        ddist = df["distance_m"].diff().fillna(0.0)
-        df["speed_m_s"] = (ddist / df["dt"]).clip(lower=0.0)
+        df["speed_m_s"] = speed_from_dist
     else:
-        # still fill remaining NaNs using distance
-        ddist = df["distance_m"].diff().fillna(0.0)
-        speed_from_dist = (ddist / df["dt"]).clip(lower=0.0)
         df["speed_m_s"] = df["speed_m_s"].fillna(speed_from_dist)
 
     return df
@@ -142,7 +136,6 @@ def compute_slopes(df: pd.DataFrame) -> pd.DataFrame:
     dalt = df["alt_smooth"].diff().fillna(0.0)
     ddist = df["dist_smooth"].diff().fillna(1.0)
 
-    # пазим се от много малки разлики
     ddist = ddist.where(ddist.abs() > 0.5, np.nan)  # <0.5 m – шум
     slope_dec = (dalt / ddist).replace([np.inf, -np.inf], np.nan).fillna(0.0)
     slope_dec = slope_dec.clip(lower=-0.5, upper=0.5)  # -50% до +50%
@@ -189,8 +182,7 @@ def estimate_mu_eff(df: pd.DataFrame) -> float:
         seg_idx = np.where(df["seg_id"].values == sid)[0]
         if len(seg_idx) < 10:
             continue  # минимум 10 s
-        # махаме първите 5 s
-        seg_idx = seg_idx[5:]
+        seg_idx = seg_idx[5:]  # махаме първите 5 s
         use_mask[seg_idx] = True
 
     # допълнителни филтри
@@ -202,15 +194,12 @@ def estimate_mu_eff(df: pd.DataFrame) -> float:
 
     subset = df.loc[use_mask].copy()
 
-    # theta от наклона
     subset["theta"] = np.arctan(subset["slope_dec"].values)
     sin_theta = np.sin(subset["theta"])
     cos_theta = np.cos(subset["theta"])
 
-    # mu ≈ -(a + g sinθ) / (g cosθ)
     mu = -(subset["a"].values + G * sin_theta) / (G * cos_theta)
 
-    # чистим нереални стойности
     mu = np.where(np.isfinite(mu), mu, np.nan)
     mu = np.where((mu >= 0.001) & (mu <= 0.2), mu, np.nan)
 
@@ -369,19 +358,39 @@ def main():
         """
     )
 
-    # данни за графика
+    # данни за графика (чистим NaN)
     plot_df = pd.DataFrame(
         {
             "Време [мин]": df_sel["time_s"] / 60.0,
             "Скорост реална [km/h]": df_sel["speed_m_s"] * 3.6,
             "Скорост модулирана [km/h]": df_sel["speed_mod_m_s"] * 3.6,
         }
-    )
+    ).dropna()
 
-    st.line_chart(plot_df.set_index("Време [мин]"))
+    if plot_df.empty:
+        st.warning("Няма достатъчно валидни данни за визуализация.")
+    else:
+        # Altair: две линии + легенда
+        chart = (
+            alt.Chart(plot_df)
+            .transform_fold(
+                ["Скорост реална [km/h]", "Скорост модулирана [km/h]"],
+                as_=["Вид", "Скорост"],
+            )
+            .mark_line()
+            .encode(
+                x=alt.X("Време [мин]:Q", title="Време [мин]"),
+                y=alt.Y("Скорост:Q", title="Скорост [km/h]"),
+                color=alt.Color("Вид:N", title="Тип скорост"),
+                tooltip=["Време [мин]:Q", "Вид:N", "Скорост:Q"],
+            )
+            .properties(height=350)
+        )
+
+        st.altair_chart(chart, use_container_width=True)
 
     st.caption(
-        "Забележка: Модулираната скорост показва каква би била скоростта при същото усилие, "
+        "Модулираната скорост показва каква би била скоростта при същото усилие, "
         "ако плъзгаемостта/триенето беше равна на избраната µ_ref."
     )
 
