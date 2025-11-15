@@ -1,19 +1,15 @@
 """
-friction_model.py  (segment v5 — стабилна версия)
+friction_model.py  (v6 — trend smoothing + segment μ)
 
 Имплементация на модела за коефициент на триене и модулиране на скоростта
 с фиксирана референтна активност.
 
-Основни характеристики:
-- Премахване на дублирани time_s.
-- Free-glide маска (slope < праг, v > праг, T_cut, Tmin_free).
-- Сегментен анализ:
-    * линейна регресия v(t) → a_seg
-    * медиана на slope → slope_seg
-    * μ_seg = (sinθ − a_seg/g) / cosθ
-- Филтрация само по μ_min / μ_max (НЕ проверяваме a_seg < 0).
-- μ_session = медиана от валидните μ_seg.
-- Модулация: K_raw = μ_session / μ_ref.
+Новото във v6:
+- Добавена е "плаваща" тренд линия за височина и дистанция:
+  * h_trend = rolling mean на h_smooth с по-широк прозорец (примерно 31 s)
+  * d_trend = rolling mean на d_smooth със същия прозорец
+- slope и v се изчисляват от h_trend / d_trend вместо от h_smooth / d_smooth.
+- Продължаваме да използваме сегментен подход (v(t) регресия → a_seg → μ_seg).
 """
 
 from __future__ import annotations
@@ -55,7 +51,7 @@ def _load_tcx(file_obj: io.BytesIO, filename: str) -> pd.DataFrame:
             times.append(pd.to_datetime(t_el.text))
             alts.append(float(a_el.text))
             dists.append(float(d_el.text))
-        except:
+        except Exception:
             continue
 
     if not times:
@@ -131,11 +127,18 @@ def load_activity(file_obj: io.BytesIO, filename: str) -> pd.DataFrame:
 
 
 # --------------------------------------------------------------
-#  RESAMPLING & KINEMATICS
+#  RESAMPLING & KINEMATICS (с trend линия)
 # --------------------------------------------------------------
 
 def _resample_and_smooth(df: pd.DataFrame) -> pd.DataFrame:
-    """Ресемплиране на 1 Hz + изглаждане."""
+    """
+    Ресемплиране на 1 Hz + изглаждане + trend линия.
+
+    - h_smooth: 5 s rolling mean (локално изглаждане)
+    - d_smooth: 3-точково rolling mean
+    - h_trend: 31 s rolling mean на h_smooth (trend линия, подобно на Garmin)
+    - d_trend: 31 s rolling mean на d_smooth
+    """
     df = df.sort_values("time_s").reset_index(drop=True)
     t_min, t_max = df["time_s"].min(), df["time_s"].max()
 
@@ -149,20 +152,37 @@ def _resample_and_smooth(df: pd.DataFrame) -> pd.DataFrame:
         .reset_index()
     )
 
+    # локално изглаждане
     df_interp["h_smooth"] = df_interp["h"].rolling(5, center=True, min_periods=1).mean()
     df_interp["d_smooth"] = df_interp["d"].rolling(3, center=True, min_periods=1).mean()
+
+    # trend линия (по-широк прозорец)
+    trend_window = 31  # ~30 s прозорец
+    df_interp["h_trend"] = (
+        df_interp["h_smooth"].rolling(trend_window, center=True, min_periods=1).mean()
+    )
+    df_interp["d_trend"] = (
+        df_interp["d_smooth"].rolling(trend_window, center=True, min_periods=1).mean()
+    )
 
     return df_interp
 
 
 def _compute_kinematics(df: pd.DataFrame) -> pd.DataFrame:
-    """Смята slope, v, a."""
-    df = df.copy()
-    dh = df["h_smooth"].diff()
-    dd = df["d_smooth"].diff()
+    """
+    Смята slope, v, a, използвайки trend линия.
 
-    df["slope"] = dh / dd.replace(0, np.nan)
-    df["v"] = dd  # 1 Hz → Δd/1
+    - slope = Δh_trend / Δd_trend
+    - v = Δd_trend / Δt  (тук Δt = 1 s)
+    - a = централна разлика на v
+    """
+    df = df.copy()
+
+    dh_trend = df["h_trend"].diff()
+    dd_trend = df["d_trend"].diff()
+
+    df["slope"] = dh_trend / dd_trend.replace(0, np.nan)
+    df["v"] = dd_trend  # защото dt = 1 s
     df["a"] = (df["v"].shift(-1) - df["v"].shift(1)) / 2.0
 
     return df
@@ -172,7 +192,13 @@ def _compute_kinematics(df: pd.DataFrame) -> pd.DataFrame:
 #  FREE-GLIDE DETECTION
 # --------------------------------------------------------------
 
-def _detect_free_glide_mask(df, S_thr_percent, v_min, T_cut, Tmin_free):
+def _detect_free_glide_mask(
+    df: pd.DataFrame,
+    S_thr_percent: float,
+    v_min: float,
+    T_cut: int,
+    Tmin_free: int,
+) -> pd.Series:
     """Създава маска за free-glide секунди."""
     S_thr = S_thr_percent / 100.0
     is_desc = (df["slope"] < S_thr) & (df["v"] > v_min)
@@ -205,7 +231,7 @@ def _detect_free_glide_mask(df, S_thr_percent, v_min, T_cut, Tmin_free):
 
 def _extract_segments(is_free: pd.Series, Tmin_seg: int) -> List[Tuple[int, int]]:
     """Връща списък от (start, end) free-glide сегменти."""
-    segs = []
+    segs: List[Tuple[int, int]] = []
     in_seg, s_idx = False, None
 
     for i, fl in enumerate(is_free.values):
@@ -225,12 +251,17 @@ def _extract_segments(is_free: pd.Series, Tmin_seg: int) -> List[Tuple[int, int]
 #  SEGMENT μ CALCULATION
 # --------------------------------------------------------------
 
-def _estimate_mu_segments(df, segments, mu_min, mu_max):
+def _estimate_mu_segments(
+    df: pd.DataFrame,
+    segments: List[Tuple[int, int]],
+    mu_min: float,
+    mu_max: float,
+) -> Tuple[pd.Series, pd.DataFrame]:
     """
     За всеки сегмент:
     - регресия v(t) → a_seg
     - slope_seg = медиана(slope)
-    - μ_seg = (sinθ - a_seg/g) / cosθ
+    - μ_seg = (sinθ − a_seg/g) / cosθ
     Филтрираме само по μ_min <= μ_seg <= μ_max.
     """
     mu_seg_label = pd.Series(np.nan, index=df.index)
@@ -246,7 +277,7 @@ def _estimate_mu_segments(df, segments, mu_min, mu_max):
 
         try:
             coeffs = np.polyfit(t, v, 1)
-        except:
+        except Exception:
             continue
 
         a_seg = coeffs[0]
@@ -292,34 +323,59 @@ def _estimate_mu_segments(df, segments, mu_min, mu_max):
 def process_activity_file(
     file_obj,
     filename: str,
-    S_thr_percent=-2.0,
-    v_min=2.0,
-    T_cut=5,
-    Tmin_free=5,
-    mu_min=0.0,
-    mu_max=0.2,
-):
-    """Обработва цяла активност и връща μ_session и сегменти."""
+    S_thr_percent: float = -2.0,
+    v_min: float = 2.0,
+    T_cut: int = 5,
+    Tmin_free: int = 5,
+    mu_min: float = 0.0,
+    mu_max: float = 0.2,
+) -> Dict[str, Any]:
+    """
+    Обработва цяла активност и връща:
+    {
+        "name": filename,
+        "df": df (с всички колони),
+        "segments": seg_df,
+        "mu_session": медиана(μ_seg),
+        "n_valid": обща продължителност на валидните сегменти (s),
+        "FI": None,
+        "K": None,
+    }
+    """
+    # четем файла в buffer за повече от едно ползване
     bytes_data = file_obj.read()
     file_obj.seek(0)
     buffer = io.BytesIO(bytes_data)
 
     df_raw = load_activity(buffer, filename)
-    df_raw = df_raw.sort_values("time_s").drop_duplicates("time_s").reset_index(drop=True)
+    df_raw = df_raw.sort_values("time_s").drop_duplicates("time_s").reset_index(
+        drop=True
+    )
 
     df = _resample_and_smooth(df_raw)
     df = _compute_kinematics(df)
 
-    is_free = _detect_free_glide_mask(df, S_thr_percent, v_min, T_cut, Tmin_free)
+    is_free = _detect_free_glide_mask(
+        df,
+        S_thr_percent=S_thr_percent,
+        v_min=v_min,
+        T_cut=T_cut,
+        Tmin_free=Tmin_free,
+    )
     segments = _extract_segments(is_free, Tmin_free)
 
-    mu_seg_label, seg_df = _estimate_mu_segments(df, segments, mu_min, mu_max)
+    mu_seg_label, seg_df = _estimate_mu_segments(
+        df,
+        segments=segments,
+        mu_min=mu_min,
+        mu_max=mu_max,
+    )
 
     df["is_free_glide"] = is_free
     df["mu_seg_label"] = mu_seg_label
 
     if seg_df.empty:
-        raise ValueError("Няма валидни free-glide сегменти за μ.")
+        raise ValueError("Няма валидни free-glide сегменти за μ (провери параметрите).")
 
     mu_session = float(seg_df["mu_seg"].median())
     n_valid = int(seg_df["duration_s"].sum())
@@ -340,9 +396,24 @@ def process_activity_file(
 # --------------------------------------------------------------
 
 def compute_friction_indices_and_modulation(
-    activities, ref_name, delta_up, delta_down
-):
-    """Модулация на скоростта."""
+    activities: Dict[str, Dict[str, Any]],
+    ref_name: str,
+    delta_up: float,
+    delta_down: float,
+) -> None:
+    """
+    Изчислява Friction Index (FI) и модулатор K за всяка активност спрямо
+    избраната референтна, след което добавя колоната v_mod в df.
+
+    - FI = mu_session / mu_ref
+    - K_raw = mu_session / mu_ref
+      * mu_session > mu_ref  -> K_raw > 1 (по-тежки условия -> повишаваме скоростта)
+      * mu_session < mu_ref  -> K_raw < 1 (по-бързи условия -> намаляваме скоростта)
+    - K се ограничава в [1 - delta_down, 1 + delta_up].
+    """
+    if ref_name not in activities:
+        raise ValueError("Референтната активност не е налична.")
+
     mu_ref = activities[ref_name]["mu_session"]
 
     for name, act in activities.items():
@@ -351,7 +422,9 @@ def compute_friction_indices_and_modulation(
         FI = mu_ses / mu_ref
         K_raw = mu_ses / mu_ref
 
-        K = max(1.0 - delta_down, min(K_raw, 1.0 + delta_up))
+        K_min = 1.0 - delta_down
+        K_max = 1.0 + delta_up
+        K = max(K_min, min(K_raw, K_max))
 
         df = act["df"].copy()
         df["v_mod"] = df["v"] * K
