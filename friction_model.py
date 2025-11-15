@@ -415,8 +415,8 @@ def compute_friction_indices_and_modulation(
     for name, act in activities.items():
         mu_session = act["mu_session"]
 
-        FI = mu_session / mu_ref  # Friction Index
-        K_raw = mu_ref / mu_session  # теоретичен коефициент за модулация
+       FI = mu_session / mu_ref
+K_raw = mu_session / mu_ref   # <-- поправено
 
         # Ограничаване
         K_min = 1.0 - delta_down
