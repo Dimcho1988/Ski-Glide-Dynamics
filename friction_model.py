@@ -209,6 +209,7 @@ def compute_session_friction(
     a_max: float = 0.4,
     mu_min: float = 0.0,
     mu_max: float = 0.2,
+    **kwargs,
 ) -> Dict[str, Any]:
     """Compute μ_session for a given activity.
 
