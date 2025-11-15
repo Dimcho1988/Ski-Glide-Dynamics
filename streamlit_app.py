@@ -5,7 +5,6 @@ import xml.etree.ElementTree as ET
 import numpy as np
 import pandas as pd
 import streamlit as st
-import altair as alt  # за визуализация
 
 G = 9.81  # gravitational acceleration m/s^2
 
@@ -332,7 +331,7 @@ def main():
         df_mod = modulate_speed(df, mu_eff=mu_eff, mu_ref=mu_ref)
         activities[name]["df"] = df_mod
 
-    # изчисляваме средните модулирани скорости за таблицата (от df_mod)
+    # изчисляваме средните модулирани скорости за таблицата
     mod_speeds = []
     for name in summary_df["Файл"]:
         df_mod = activities[name]["df"]
@@ -361,34 +360,21 @@ def main():
         """
     )
 
-    # данни за графика (чистим NaN)
+    # малък debug – да видиш първите 10 реда
+    st.write("Първи 10 реда за избраната активност:")
+    st.write(df_sel[["time_s", "speed_m_s", "speed_mod_m_s"]].head(10))
+
+    # данни за графика
     plot_df = pd.DataFrame(
         {
             "Време [мин]": df_sel["time_s"] / 60.0,
-            "Скорост реална [km/h]": df_sel["speed_m_s"] * 3.6,
-            "Скорост модулирана [km/h]": df_sel["speed_mod_m_s"] * 3.6,
+            "Реална скорост [km/h]": df_sel["speed_m_s"] * 3.6,
+            "Модулирана скорост [km/h]": df_sel["speed_mod_m_s"] * 3.6,
         }
-    ).dropna()
+    )
+    plot_df = plot_df.set_index("Време [мин]")
 
-    if plot_df.empty:
-        st.warning("Няма достатъчно валидни данни за визуализация.")
-    else:
-        chart = (
-            alt.Chart(plot_df)
-            .transform_fold(
-                ["Скорост реална [km/h]", "Скорост модулирана [km/h]"],
-                as_=["Тип скорост", "Скорост"],
-            )
-            .mark_line()
-            .encode(
-                x=alt.X("Време [мин]:Q", title="Време [мин]"),
-                y=alt.Y("Скорост:Q", title="Скорост [km/h]"),
-                color=alt.Color("Тип скорост:N", title="Тип скорост"),
-                tooltip=["Време [мин]:Q", "Тип скорост:N", "Скорост:Q"],
-            )
-            .properties(height=350)
-        )
-        st.altair_chart(chart, use_container_width=True)
+    st.line_chart(plot_df)
 
     st.caption(
         "Модулираната скорост показва каква би била скоростта при същото усилие, "
