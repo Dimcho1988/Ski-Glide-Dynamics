@@ -1,24 +1,21 @@
-
 """
-friction_model.py  (v2 – с фиксиране на дублирани времеви точки)
+friction_model.py  (v3)
 
 Имплементация на модела за коефициент на триене и модулиране на скоростта
 с фиксирана референтна активност.
 
-Основни стъпки (накратко):
-1) Зареждане на активност (TCX или CSV) и извеждане на time, altitude, distance.
-2) Ресемплиране до 1 Hz и изглаждане на височината и дистанцията.
-3) Изчисляване на slope, скорост v и ускорение a.
-4) Детекция на "свободно плъзгане" (free glide).
-5) Оценка на μ_eff по уравнението a = g (sin(theta) - μ cos(theta)).
-6) Сесийна оценка μ_session (медиана).
-7) Сравнения спрямо референтна активност и модулиране на скоростта.
+Новото във v3:
+- Премахване на дублирани времеви точки (time_s), за да няма
+  грешка 'cannot reindex on an axis with duplicate labels'.
+- Коригирана логика за модулация на скоростта:
+  K_raw = mu_session / mu_ref
+  (по-високо триене -> по-бавни условия -> скоростта се увеличава при мапване
+   към референтни; по-ниско триене -> скоростта се намалява).
 """
 
 from __future__ import annotations
 
 import io
-import math
 import xml.etree.ElementTree as ET
 from typing import Dict, Any
 
@@ -175,8 +172,8 @@ def load_activity(file_obj: io.BytesIO, filename: str) -> pd.DataFrame:
 def _resample_and_smooth(df: pd.DataFrame) -> pd.DataFrame:
     """
     Ресемплиране до 1 Hz и изглаждане:
-    - hsmooth: 5-секундно подвижно средно (centered)
-    - dsmooth: 3-точково подвижно средно
+    - h_smooth: 5-секундно подвижно средно (centered)
+    - d_smooth: 3-точково подвижно средно
     """
     df = df.sort_values("time_s").reset_index(drop=True)
 
@@ -337,10 +334,10 @@ def process_activity_file(
         "K": None (ще се изчисли по-късно),
     }
 
-    В тази v2 версия са добавени:
+    В тази v3 версия са добавени:
     - сортиране по time_s
     - премахване на дублирани time_s (duplicate timestamps)
-    за да се избегне грешката "cannot reindex on an axis with duplicate labels".
+    - коригирана логика за K_raw = mu_session / mu_ref
     """
     # Нужно е да можем да четем файла повече от веднъж
     bytes_data = file_obj.read()
@@ -349,12 +346,11 @@ def process_activity_file(
 
     df_raw = load_activity(buffer, filename)
 
-    # ---- НОВО: фиксиране на дублирани времеви точки ----
+    # фиксиране на дублирани времеви точки
     df_raw = df_raw.sort_values("time_s")
-    before = len(df_raw)
-    df_raw = df_raw.drop_duplicates(subset=["time_s"], keep="first").reset_index(drop=True)
-    after = len(df_raw)
-    # (по желание може да логнем броя премахнати точки, но тук не вдигаме грешка)
+    df_raw = df_raw.drop_duplicates(subset=["time_s"], keep="first").reset_index(
+        drop=True
+    )
 
     df = _resample_and_smooth(df_raw)
     df = _compute_kinematics(df)
@@ -381,7 +377,9 @@ def process_activity_file(
     n_valid = int(valid_mu.shape[0])
 
     if n_valid == 0:
-        raise ValueError("Няма валидни секунди за изчисляване на μ_eff (провери параметрите).")
+        raise ValueError(
+            "Няма валидни секунди за изчисляване на μ_eff (провери параметрите)."
+        )
 
     mu_session = float(valid_mu.median())
 
@@ -406,6 +404,12 @@ def compute_friction_indices_and_modulation(
     """
     Изчислява Friction Index (FI) и модулатор K за всяка активност спрямо
     избраната референтна, след което добавя колоната v_mod в df.
+
+    - FI = mu_session / mu_ref
+    - K_raw = mu_session / mu_ref
+      * mu_session > mu_ref  -> K_raw > 1  (по-тежки условия -> повишаваме скоростта)
+      * mu_session < mu_ref  -> K_raw < 1  (по-бързи условия -> намаляваме скоростта)
+    - K се ограничава в [1 - delta_down, 1 + delta_up]
     """
     if ref_name not in activities:
         raise ValueError("Референтната активност не е налична.")
@@ -415,13 +419,15 @@ def compute_friction_indices_and_modulation(
     for name, act in activities.items():
         mu_session = act["mu_session"]
 
-       FI = mu_session / mu_ref
-K_raw = mu_session / mu_ref   # <-- поправено
+        # Friction Index
+        FI = mu_session / mu_ref
+
+        # теоретичен коефициент за модулация
+        K_raw = mu_session / mu_ref
 
         # Ограничаване
         K_min = 1.0 - delta_down
         K_max = 1.0 + delta_up
-
         K = max(K_min, min(K_raw, K_max))
 
         df = act["df"].copy()
