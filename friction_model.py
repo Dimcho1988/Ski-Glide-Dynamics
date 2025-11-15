@@ -1,420 +1,316 @@
-
-"""
-friction_model.py
-
-Имплементация на модела за коефициент на триене и модулиране на скоростта
-с фиксирана референтна активност.
-
-Основни стъпки (накратко):
-1) Зареждане на активност (TCX или CSV) и извеждане на time, altitude, distance.
-2) Ресемплиране до 1 Hz и изглаждане на височината и дистанцията.
-3) Изчисляване на slope, скорост v и ускорение a.
-4) Детекция на "свободно плъзгане" (free glide).
-5) Оценка на μ_eff по уравнението a = g (sin(theta) - μ cos(theta)).
-6) Сесийна оценка μ_session (медиана).
-7) Сравнения спрямо референтна активност и модулиране на скоростта.
-"""
-
-from __future__ import annotations
-
-import io
-import math
 import xml.etree.ElementTree as ET
-from typing import Dict, Any
+from io import BytesIO
+from typing import Dict, Any, Optional
 
 import numpy as np
 import pandas as pd
 
-
-G = 9.81  # гравитационно ускорение, m/s^2
-
-
-# ---------------- ПАРСВАНЕ НА ФАЙЛОВЕ ---------------- #
+G = 9.81  # m/s^2
 
 
-def _load_tcx(file_obj: io.BytesIO, filename: str) -> pd.DataFrame:
-    """
-    Минимален парсър за TCX:
-    - Time (ISO 8601)
-    - AltitudeMeters
-    - DistanceMeters
+def parse_tcx_to_df(uploaded_file) -> Optional[pd.DataFrame]:
+    """Parse a TCX file (UploadedFile) into a DataFrame with time, altitude, distance.
 
-    Връща DataFrame с колони:
-    time_s (s от началото), h (m), d (m)
+    Returns
+    -------
+    df : pd.DataFrame with DateTimeIndex and columns ['altitude', 'distance']
     """
     try:
-        content = file_obj.read()
-        file_obj.seek(0)
-        root = ET.fromstring(content)
-    except Exception as e:
-        raise ValueError(f"Грешка при парсване на TCX ({filename}): {e}")
+        content = uploaded_file.read()
+        uploaded_file.seek(0)
+        tree = ET.parse(BytesIO(content))
+        root = tree.getroot()
+    except Exception:
+        return None
 
-    ns = {"tcx": "http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2"}
-    trackpoints = root.findall(".//tcx:Trackpoint", ns)
+    ns = {}
+    if root.tag.startswith("{"):
+        uri = root.tag.split("}")[0].strip("{")
+        ns["tcx"] = uri
 
+    # Search for Trackpoints
     times = []
     alts = []
     dists = []
 
-    for tp in trackpoints:
-        t_el = tp.find("tcx:Time", ns)
-        a_el = tp.find("tcx:AltitudeMeters", ns)
-        d_el = tp.find("tcx:DistanceMeters", ns)
+    for tp in root.findall(".//tcx:Trackpoint", ns):
+        time_el = tp.find("tcx:Time", ns)
+        alt_el = tp.find("tcx:AltitudeMeters", ns)
+        dist_el = tp.find("tcx:DistanceMeters", ns)
 
-        if t_el is None or a_el is None or d_el is None:
+        if time_el is None or alt_el is None or dist_el is None:
             continue
 
         try:
-            times.append(pd.to_datetime(t_el.text))
-            alts.append(float(a_el.text))
-            dists.append(float(d_el.text))
+            t = pd.to_datetime(time_el.text)
+            alt = float(alt_el.text)
+            dist = float(dist_el.text)
         except Exception:
             continue
 
+        times.append(t)
+        alts.append(alt)
+        dists.append(dist)
+
     if not times:
-        raise ValueError("Не бяха намерени валидни Trackpoint в TCX файла.")
-
-    t0 = times[0]
-    time_s = np.array([(t - t0).total_seconds() for t in times], dtype=float)
+        return None
 
     df = pd.DataFrame(
-        {
-            "time_s": time_s,
-            "h": np.array(alts, dtype=float),
-            "d": np.array(dists, dtype=float),
-        }
-    )
+        {"time": times, "altitude": alts, "distance": dists}
+    ).dropna(subset=["time"])
+
+    df = df.sort_values("time")
+    df = df.drop_duplicates(subset=["time"])
+    df = df.set_index("time")
+
+    # Reindex to 1 Hz
+    full_index = pd.date_range(df.index.min(), df.index.max(), freq="1S")
+    df = df.reindex(full_index)
+
+    # Interpolate altitude and distance
+    for col in ["altitude", "distance"]:
+        df[col] = df[col].interpolate(method="time", limit_direction="both")
+
+    # Distance should be non-decreasing
+    df["distance"] = df["distance"].cummax()
 
     return df
 
 
-def _load_csv(file_obj: io.BytesIO, filename: str) -> pd.DataFrame:
-    """
-    Очакван CSV формат:
-
-    - Колона "time" (s) или "Time" / "seconds"
-    - Колона "elevation" или "altitude" (m)
-    - Колона "distance" или "dist" (m)
-
-    Връща DataFrame с колони:
-    time_s (s от началото), h (m), d (m)
-    """
-    try:
-        df_raw = pd.read_csv(file_obj)
-    except Exception as e:
-        raise ValueError(f"Грешка при четене на CSV ({filename}): {e}")
-
-    cols = {c.lower(): c for c in df_raw.columns}
-
-    # време
-    time_col = None
-    for key in ["time", "seconds", "t"]:
-        if key in cols:
-            time_col = cols[key]
-            break
-    if time_col is None:
-        raise ValueError("CSV трябва да съдържа колона 'time' или 'seconds' (s).")
-
-    # височина
-    elev_col = None
-    for key in ["elevation", "altitude", "alt", "h"]:
-        if key in cols:
-            elev_col = cols[key]
-            break
-    if elev_col is None:
-        raise ValueError("CSV трябва да съдържа колона 'elevation' или 'altitude' (m).")
-
-    # дистанция
-    dist_col = None
-    for key in ["distance", "dist", "d"]:
-        if key in cols:
-            dist_col = cols[key]
-            break
-    if dist_col is None:
-        raise ValueError("CSV трябва да съдържа колона 'distance' или 'dist' (m).")
-
-    time_values = df_raw[time_col].values
-
-    # Ако времето не е числово, опитваме да го парснем като datetime
-    if not np.issubdtype(df_raw[time_col].dtype, np.number):
-        times = pd.to_datetime(df_raw[time_col])
-        t0 = times.iloc[0]
-        time_s = (times - t0).dt.total_seconds().astype(float).values
-    else:
-        time_s = time_values.astype(float)
-        # нормализираме така, че да започва от 0
-        time_s = time_s - time_s[0]
-
-    df = pd.DataFrame(
-        {
-            "time_s": time_s,
-            "h": df_raw[elev_col].astype(float).values,
-            "d": df_raw[dist_col].astype(float).values,
-        }
-    )
-
-    return df
-
-
-def load_activity(file_obj: io.BytesIO, filename: str) -> pd.DataFrame:
-    """
-    Генеричен loader за TCX или CSV. Връща DataFrame с time_s, h, d.
-    """
-    name = filename.lower()
-    if name.endswith(".tcx"):
-        return _load_tcx(file_obj, filename)
-    elif name.endswith(".csv"):
-        return _load_csv(file_obj, filename)
-    else:
-        raise ValueError("Неподдържан формат. Използвай .tcx или .csv.")
-
-
-# ---------------- ЯДРО НА МОДЕЛА ---------------- #
-
-
-def _resample_and_smooth(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Ресемплиране до 1 Hz и изглаждане:
-    - hsmooth: 5-секундно подвижно средно (centered)
-    - dsmooth: 3-точково подвижно средно
-    """
-    df = df.sort_values("time_s").reset_index(drop=True)
-
-    t_min = df["time_s"].min()
-    t_max = df["time_s"].max()
-    t_grid = np.arange(0, int(np.round(t_max - t_min)) + 1, 1.0, dtype=float)
-
-    base = pd.DataFrame({"time_s": t_grid})
-    base = base.set_index("time_s")
-
-    df_interp = df.set_index("time_s")[["h", "d"]].reindex(
-        base.index
-    ).interpolate(method="linear", limit_direction="both")
-
-    df_interp = df_interp.reset_index()
-
-    # изглаждане
-    df_interp["h_smooth"] = (
-        df_interp["h"].rolling(window=5, center=True, min_periods=1).mean()
-    )
-    df_interp["d_smooth"] = (
-        df_interp["d"].rolling(window=3, center=True, min_periods=1).mean()
-    )
-
-    return df_interp
-
-
-def _compute_kinematics(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Изчислява slope, скорост v и ускорение a (централна разлика).
-    """
-    df = df.copy()
-    dt = 1.0
-
-    # прирасти
-    dh = df["h_smooth"].diff()
-    dd = df["d_smooth"].diff()
-
-    # slope = Δh / Δd
-    slope = dh / dd.replace(0, np.nan)
-    df["slope"] = slope
-
-    # скорост по трасето
-    v = dd / dt
-    df["v"] = v
-
-    # ускорение (централна разлика)
-    v_forward = df["v"].shift(-1)
-    v_backward = df["v"].shift(1)
-    a = (v_forward - v_backward) / (2 * dt)
-    df["a"] = a
-
-    return df
-
-
-def _detect_free_glide(
+def _compute_kinematics(
     df: pd.DataFrame,
-    S_thr_percent: float,
+    slope_thr: float,
     v_min: float,
-    T_cut: int,
-    Tmin_free: int,
-) -> pd.Series:
-    """
-    Детекция на "свободно плъзгане".
+    trend_window: int,
+    slope_window: int = 11,
+) -> pd.DataFrame:
+    """Compute smoothed height, trend line, slope, velocity, acceleration."""
+    out = df.copy()
 
-    Връща булева Series is_free_glide със същата дължина като df.
-    """
-    df = df.copy()
+    # Basic rolling smoothing
+    out["h_smooth"] = out["altitude"].rolling(window=5, center=True, min_periods=1).mean()
+    out["d_smooth"] = out["distance"].rolling(window=3, center=True, min_periods=1).mean()
 
-    # S_thr е в %, slope е безразмерен => сравняваме със S_thr/100
-    S_thr = S_thr_percent / 100.0
+    # Trend line on altitude (bigger window)
+    W_trend = max(5, int(trend_window))
+    if W_trend % 2 == 0:
+        W_trend += 1  # make it odd for symmetry
+    out["h_trend"] = out["h_smooth"].rolling(window=W_trend, center=True, min_periods=1).mean()
 
-    is_desc = (df["slope"] < S_thr) & (df["v"] > v_min)
+    # --- СКЛОН ВЪРХУ ПО-ДЪЛЪГ ПРОЗОРЕЦ (примерно 10–11 s) ---
+    W_slope = max(3, int(slope_window))
+    if W_slope % 2 == 0:
+        W_slope += 1
+    half = W_slope // 2
 
-    is_free = pd.Series(False, index=df.index)
+    dh = out["h_trend"].shift(-half) - out["h_trend"].shift(half)
+    dd = out["d_smooth"].shift(-half) - out["d_smooth"].shift(half)
 
-    # намираме сегменти
-    in_block = False
-    start_idx = None
+    # Guard against tiny dd (почти няма движение)
+    small_dd = dd.abs() < 0.5  # 0.5 m за ~10 s = много бавна промяна
+    dh[small_dd] = np.nan
+    dd[small_dd] = np.nan
 
-    for i, val in enumerate(is_desc.values):
-        if val and not in_block:
-            in_block = True
-            start_idx = i
-        elif not val and in_block:
-            end_idx = i - 1
-            # обработваме сегмента [start_idx, end_idx]
-            length = end_idx - start_idx + 1
-            if length > T_cut + Tmin_free:
-                real_start = start_idx + T_cut
-                real_end = end_idx
-                is_free.iloc[real_start : real_end + 1] = True
-            in_block = False
+    slope = dh / dd  # [-] (rise/run)
+    slope = slope.clip(-0.3, 0.3)  # -30% до +30% за здрав разум
+    slope_pct = slope * 100.0
 
-    # ако свършва с блок
-    if in_block:
-        end_idx = len(is_desc) - 1
-        length = end_idx - start_idx + 1
-        if length > T_cut + Tmin_free:
-            real_start = start_idx + T_cut
-            real_end = end_idx
-            is_free.iloc[real_start : real_end + 1] = True
+    out["slope"] = slope
+    out["slope_pct"] = slope_pct
 
-    return is_free
+    # Velocity (m/s) – 1 s diff + леко изглаждане
+    v = out["d_smooth"].diff()
+    v.iloc[0] = 0.0
+    v = v.rolling(window=3, center=True, min_periods=1).mean()
+    out["v"] = v
+
+    # Acceleration (m/s^2) – централна разлика + изглаждане
+    a = (out["v"].shift(-1) - out["v"].shift(1)) / 2.0
+    a.iloc[0] = 0.0
+    a.iloc[-1] = 0.0
+    a = a.rolling(window=3, center=True, min_periods=1).mean()
+    out["a"] = a
+
+    # Геометрични кандидати за спускане
+    is_desc_geom = (out["slope_pct"] <= slope_thr) & (out["v"] > v_min)
+    out["is_desc_raw"] = is_desc_geom
+
+    return out
 
 
-def _compute_mu_eff_for_free_glide(
+def _mark_free_glide_segments(
     df: pd.DataFrame,
-    is_free_glide: pd.Series,
-    mu_min: float,
-    mu_max: float,
-) -> pd.Series:
+    t_cut: int,
+    t_min_free: int,
+    a_max: float,
+) -> pd.DataFrame:
+    """Mark free-glide seconds based on consecutive candidate segments.
+
+    Parameters
+    ----------
+    t_cut : int
+        Seconds to cut from the beginning of each candidate segment.
+    t_min_free : int
+        Minimal remaining length (in seconds) to keep a segment.
+    a_max : float
+        Maximal absolute acceleration (m/s^2) to be considered "free glide".
     """
-    Изчислява μ_eff само за секундите на свободно плъзгане.
-    """
-    df = df.copy()
+    out = df.copy()
 
-    # ограничаваме slope за стабилност
-    slope = df["slope"].clip(lower=-0.5, upper=0.0)
+    # Кандидатите са тези със спускане + ниско ускорение (почти без оттласкване)
+    is_desc = out["is_desc_raw"].fillna(False).astype(bool)
+    low_acc = out["a"].abs() <= a_max
+    is_candidate = is_desc & low_acc
 
-    theta = np.arctan(slope.values)
-    a = df["a"].values
+    out["free_glide"] = False
 
-    sin_theta = np.sin(theta)
-    cos_theta = np.cos(theta)
+    if not is_candidate.any():
+        return out
 
-    # μ_eff = (sinθ - a/g) / cosθ
-    with np.errstate(divide="ignore", invalid="ignore"):
-        mu_eff = (sin_theta - a / G) / cos_theta
+    # Find segments of consecutive True values
+    is_shift = is_candidate.shift(1, fill_value=False)
+    segment_start = (~is_shift & is_candidate)
+    segment_end = (is_shift & ~is_candidate)
 
-    mu_eff_series = pd.Series(mu_eff, index=df.index)
+    starts = list(out.index[segment_start])
+    ends = list(out.index[segment_end])
 
-    # филтрация
-    mu_eff_series[~is_free_glide] = np.nan  # само в free_glide
-    mu_eff_series[(mu_eff_series < mu_min) | (mu_eff_series > mu_max)] = np.nan
+    # If candidate extends to the last row
+    if is_candidate.iloc[-1]:
+        ends.append(out.index[-1])
 
-    return mu_eff_series
+    if len(ends) < len(starts):
+        ends.append(out.index[-1])
+
+    for s, e in zip(starts, ends):
+        segment_idx = out.loc[s:e].index
+
+        # Cut first t_cut seconds
+        if len(segment_idx) <= t_cut:
+            continue
+        remaining = segment_idx[t_cut:]
+
+        # Require at least t_min_free seconds after cutting
+        if len(remaining) < t_min_free:
+            continue
+
+        out.loc[remaining, "free_glide"] = True
+
+    return out
 
 
-def process_activity_file(
-    file_obj,
-    filename: str,
-    S_thr_percent: float = -2.0,
+def compute_session_friction(
+    df: pd.DataFrame,
+    slope_thr: float = -5.0,
     v_min: float = 2.0,
-    T_cut: int = 5,
-    Tmin_free: int = 5,
+    trend_window: int = 31,
+    t_cut: int = 5,
+    t_min_free: int = 10,
+    a_max: float = 0.4,
     mu_min: float = 0.0,
     mu_max: float = 0.2,
 ) -> Dict[str, Any]:
+    """Compute μ_session for a given activity.
+
+    Returns
+    -------
+    result : dict
+        {
+            "df": DataFrame with additional columns,
+            "mu_session": float or np.nan,
+            "valid_seconds": int
+        }
     """
-    Високо ниво: взима качен файл, връща dict с:
-    {
-        "name": filename,
-        "df": DataFrame със всички колони,
-        "mu_session": float,
-        "n_valid": int,
-        "FI": None (ще се изчисли по-късно),
-        "K": None (ще се изчисли по-късно),
-    }
-    """
-    # Нужно е да можем да четем файла повече от веднъж
-    bytes_data = file_obj.read()
-    file_obj.seek(0)
-    buffer = io.BytesIO(bytes_data)
-
-    df_raw = load_activity(buffer, filename)
-
-    df = _resample_and_smooth(df_raw)
-    df = _compute_kinematics(df)
-
-    is_free = _detect_free_glide(
+    out = _compute_kinematics(
         df,
-        S_thr_percent=S_thr_percent,
+        slope_thr=slope_thr,
         v_min=v_min,
-        T_cut=T_cut,
-        Tmin_free=Tmin_free,
+        trend_window=trend_window,
+        slope_window=11,  # ~10 s прозорец за наклон
+    )
+    out = _mark_free_glide_segments(
+        out,
+        t_cut=t_cut,
+        t_min_free=t_min_free,
+        a_max=a_max,
     )
 
-    mu_eff = _compute_mu_eff_for_free_glide(
-        df,
-        is_free_glide=is_free,
-        mu_min=mu_min,
-        mu_max=mu_max,
-    )
+    free = out["free_glide"].fillna(False)
+    idx_free = out.index[free]
 
-    df["is_free_glide"] = is_free
-    df["mu_eff"] = mu_eff
+    mu_vals = []
+    out["mu_point"] = np.nan  # ще попълваме само за валидните точки
 
-    valid_mu = mu_eff.dropna()
-    n_valid = int(valid_mu.shape[0])
+    for t in idx_free:
+        row = out.loc[t]
+        a = row["a"]
+        slope = row["slope"]  # dimensionless (tan(theta))
 
-    if n_valid == 0:
-        raise ValueError("Няма валидни секунди за изчисляване на μ_eff (провери параметрите).")
+        if not np.isfinite(a) or not np.isfinite(slope):
+            continue
 
-    mu_session = float(valid_mu.median())
+        # Convert slope to angle
+        theta = np.arctan(slope)
 
-    result = {
-        "name": filename,
-        "df": df,
+        cos_theta = np.cos(theta)
+        if np.isclose(cos_theta, 0.0):
+            continue
+
+        # a = g (sin(theta) - μ cos(theta))  ->  μ = (g sin(theta) - a) / (g cos(theta))
+        mu = (G * np.sin(theta) - a) / (G * cos_theta)
+
+        if not np.isfinite(mu):
+            continue
+
+        # Physical filter
+        if mu <= mu_min or mu > mu_max:
+            continue
+
+        mu_vals.append(mu)
+        out.at[t, "mu_point"] = mu
+
+    mu_session = float(np.median(mu_vals)) if mu_vals else np.nan
+    valid_seconds = len(mu_vals)
+
+    return {
+        "df": out,
         "mu_session": mu_session,
-        "n_valid": n_valid,
-        "FI": None,
-        "K": None,
+        "valid_seconds": valid_seconds,
     }
 
-    return result
 
-
-def compute_friction_indices_and_modulation(
-    activities: Dict[str, Dict[str, Any]],
-    ref_name: str,
-    delta_up: float,
-    delta_down: float,
+def apply_reference_and_modulation(
+    activity: Dict[str, Any],
+    mu_ref: float,
+    delta_max_up: float = 0.20,
+    delta_max_down: float = 0.15,
 ) -> None:
+    """Given an activity dict (with 'df' and 'mu_session') and μ_ref,
+    compute FI and K, and add modulated speed to df as 'v_mod'.
     """
-    Изчислява Friction Index (FI) и модулатор K за всяка активност спрямо
-    избраната референтна, след което добавя колоната v_mod в df.
-    """
-    if ref_name not in activities:
-        raise ValueError("Референтната активност не е налична.")
+    mu_sess = activity.get("mu_session", np.nan)
+    df = activity["df"]
 
-    mu_ref = activities[ref_name]["mu_session"]
+    if not np.isfinite(mu_ref) or not np.isfinite(mu_sess) or mu_ref <= 0:
+        activity["FI"] = np.nan
+        activity["K"] = np.nan
+        df["v_mod"] = np.nan
+        return
 
-    for name, act in activities.items():
-        mu_session = act["mu_session"]
+    FI = mu_sess / mu_ref
+    # Raw scaling factor for speed: >1 → по-бърза скорост отчитаме, <1 → по-бавна
+    K_raw = FI
 
-        FI = mu_session / mu_ref  # Friction Index
-        K_raw = mu_ref / mu_session  # теоретичен коефициент за модулация
+    # Ограничаваме спрямо референтната скорост
+    delta = K_raw - 1.0
+    if delta > delta_max_up:
+        delta = delta_max_up
+    if delta < -delta_max_down:
+        delta = -delta_max_down
 
-        # Ограничаване
-        K_min = 1.0 - delta_down
-        K_max = 1.0 + delta_up
+    K = 1.0 + delta
 
-        K = max(K_min, min(K_raw, K_max))
+    df["v_mod"] = df["v"] * K
 
-        df = act["df"].copy()
-        df["v_mod"] = df["v"] * K
-
-        act["FI"] = float(FI)
-        act["K"] = float(K)
-        act["df"] = df
+    activity["FI"] = float(FI)
+    activity["K"] = float(K)
