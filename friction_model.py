@@ -1,27 +1,27 @@
 """
-friction_model.py  (v3)
+friction_model.py  (segment v4)
 
 Имплементация на модела за коефициент на триене и модулиране на скоростта
 с фиксирана референтна активност.
 
-Новото във v3:
-- Премахване на дублирани времеви точки (time_s), за да няма
-  грешка 'cannot reindex on an axis with duplicate labels'.
-- Коригирана логика за модулация на скоростта:
-  K_raw = mu_session / mu_ref
-  (по-високо триене -> по-бавни условия -> скоростта се увеличава при мапване
-   към референтни; по-ниско триене -> скоростта се намалява).
+Новото в segment v4:
+- Вместо да оценяваме μ_eff по секунди, работим по СЕГМЕНТИ:
+  * намираме free-glide сегменти (както и преди);
+  * за всеки сегмент правим линейна регресия v(t) -> a_seg;
+  * изчисляваме един μ_seg за целия сегмент;
+  * μ_session = медиана от всички валидни μ_seg.
+- Премахваме дублирани времеви точки (time_s).
+- Логика за модулация: K_raw = mu_session / mu_ref.
 """
 
 from __future__ import annotations
 
 import io
 import xml.etree.ElementTree as ET
-from typing import Dict, Any
+from typing import Dict, Any, List, Tuple
 
 import numpy as np
 import pandas as pd
-
 
 G = 9.81  # гравитационно ускорение, m/s^2
 
@@ -229,7 +229,7 @@ def _compute_kinematics(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _detect_free_glide(
+def _detect_free_glide_mask(
     df: pd.DataFrame,
     S_thr_percent: float,
     v_min: float,
@@ -237,9 +237,16 @@ def _detect_free_glide(
     Tmin_free: int,
 ) -> pd.Series:
     """
-    Детекция на "свободно плъзгане".
+    Детекция на "свободно плъзгане" (free glide) на ниво секунди.
 
-    Връща булева Series is_free_glide със същата дължина като df.
+    Връща булева Series is_free със същата дължина като df.
+
+    Стъпки:
+    - slope < S_thr (в %)
+    - v > v_min
+    - събираме последователни блокове (спускания)
+    - режем първите T_cut секунди от всеки блок
+    - запазваме само ако остатъкът е дълъг поне Tmin_free
     """
     df = df.copy()
 
@@ -250,7 +257,6 @@ def _detect_free_glide(
 
     is_free = pd.Series(False, index=df.index)
 
-    # намираме сегменти
     in_block = False
     start_idx = None
 
@@ -260,7 +266,6 @@ def _detect_free_glide(
             start_idx = i
         elif not val and in_block:
             end_idx = i - 1
-            # обработваме сегмента [start_idx, end_idx]
             length = end_idx - start_idx + 1
             if length > T_cut + Tmin_free:
                 real_start = start_idx + T_cut
@@ -280,37 +285,116 @@ def _detect_free_glide(
     return is_free
 
 
-def _compute_mu_eff_for_free_glide(
+def _extract_segments_from_mask(
+    is_free: pd.Series,
+    Tmin_seg: int,
+) -> List[Tuple[int, int]]:
+    """
+    Връща списък от сегменти (start_idx, end_idx), където is_free == True
+    и дължината на сегмента е поне Tmin_seg.
+    """
+    segments: List[Tuple[int, int]] = []
+
+    in_seg = False
+    s_idx = None
+
+    for i, val in enumerate(is_free.values):
+        if val and not in_seg:
+            in_seg = True
+            s_idx = i
+        elif (not val or i == len(is_free) - 1) and in_seg:
+            e_idx = i - 1 if not val else i
+            length = e_idx - s_idx + 1
+            if length >= Tmin_seg:
+                segments.append((s_idx, e_idx))
+            in_seg = False
+
+    return segments
+
+
+def _estimate_mu_per_segment(
     df: pd.DataFrame,
-    is_free_glide: pd.Series,
+    segments: List[Tuple[int, int]],
     mu_min: float,
     mu_max: float,
-) -> pd.Series:
+) -> Tuple[pd.Series, pd.DataFrame]:
     """
-    Изчислява μ_eff само за секундите на свободно плъзгане.
+    За всеки сегмент (start_idx, end_idx):
+    - правим линейна регресия v(t) -> a_seg
+    - взимаме медиана на slope в сегмента -> slope_seg
+    - изчисляваме μ_seg по физичния модел
+    - филтрираме:
+        * a_seg трябва да е отрицателно (очакваме забавяне при триене)
+        * mu_min <= μ_seg <= mu_max
+
+    Връща:
+    - Series mu_seg_label със същата дължина като df (μ_seg за секунда / NaN)
+    - DataFrame segments_df с информация за сегментите
     """
-    df = df.copy()
+    mu_seg_label = pd.Series(np.nan, index=df.index)
 
-    # ограничаваме slope за стабилност
-    slope = df["slope"].clip(lower=-0.5, upper=0.0)
+    seg_records = []
 
-    theta = np.arctan(slope.values)
-    a = df["a"].values
+    for idx, (start, end) in enumerate(segments):
+        length = end - start + 1
+        if length < 2:
+            continue
 
-    sin_theta = np.sin(theta)
-    cos_theta = np.cos(theta)
+        # време в сегмента (0,1,2,...)
+        t = np.arange(length, dtype=float)
+        v = df["v"].iloc[start : end + 1].values
 
-    # μ_eff = (sinθ - a/g) / cosθ
-    with np.errstate(divide="ignore", invalid="ignore"):
-        mu_eff = (sin_theta - a / G) / cos_theta
+        # линейна регресия v(t) = a_seg * t + b
+        # polyfit връща [slope, intercept]
+        try:
+            coeffs = np.polyfit(t, v, 1)
+        except Exception:
+            continue
 
-    mu_eff_series = pd.Series(mu_eff, index=df.index)
+        a_seg = coeffs[0]  # m/s^2
+        # slope на сегмента (медиана)
+        slope_seg = float(df["slope"].iloc[start : end + 1].median())
 
-    # филтрация
-    mu_eff_series[~is_free_glide] = np.nan  # само в free_glide
-    mu_eff_series[(mu_eff_series < mu_min) | (mu_eff_series > mu_max)] = np.nan
+        # конвертираме в ъгъл
+        theta = np.arctan(slope_seg)
 
-    return mu_eff_series
+        sin_theta = np.sin(theta)
+        cos_theta = np.cos(theta)
+
+        # очакваме a_seg да е отрицателно (намаляваща скорост)
+        if not np.isfinite(a_seg) or a_seg >= 0:
+            continue
+        if not np.isfinite(slope_seg) or cos_theta == 0:
+            continue
+
+        # μ_seg = (sinθ - a/g) / cosθ
+        mu_seg = (sin_theta - a_seg / G) / cos_theta
+
+        if not np.isfinite(mu_seg):
+            continue
+        if mu_seg < mu_min or mu_seg > mu_max:
+            continue
+
+        # валиден сегмент -> попълваме
+        mu_seg_label.iloc[start : end + 1] = mu_seg
+
+        seg_records.append(
+            {
+                "seg_id": idx,
+                "start_idx": start,
+                "end_idx": end,
+                "duration_s": length,
+                "start_time_s": float(df["time_s"].iloc[start]),
+                "end_time_s": float(df["time_s"].iloc[end]),
+                "a_seg": float(a_seg),
+                "slope_seg": float(slope_seg),
+                "mu_seg": float(mu_seg),
+            }
+        )
+
+    segments_df = pd.DataFrame(seg_records)
+
+    return mu_seg_label, segments_df
 
 
 def process_activity_file(
@@ -329,15 +413,20 @@ def process_activity_file(
         "name": filename,
         "df": DataFrame със всички колони,
         "mu_session": float,
-        "n_valid": int,
+        "n_valid": int (обща продължителност на валидните free-glide сегменти),
+        "segments": DataFrame с информация за сегментите,
         "FI": None (ще се изчисли по-късно),
         "K": None (ще се изчисли по-късно),
     }
 
-    В тази v3 версия са добавени:
-    - сортиране по time_s
-    - премахване на дублирани time_s (duplicate timestamps)
-    - коригирана логика за K_raw = mu_session / mu_ref
+    Стъпки:
+    - зареждане (TCX/CSV) и унифициране (time_s, h, d);
+    - премахване на дублирани time_s;
+    - ресемплиране и изглаждане;
+    - кинематика (slope, v, a);
+    - маска за free glide;
+    - сегменти от маската;
+    - оценка на μ_seg за всеки сегмент и медиана μ_session.
     """
     # Нужно е да можем да четем файла повече от веднъж
     bytes_data = file_obj.read()
@@ -355,7 +444,8 @@ def process_activity_file(
     df = _resample_and_smooth(df_raw)
     df = _compute_kinematics(df)
 
-    is_free = _detect_free_glide(
+    # маска за free-glide секунди
+    is_free = _detect_free_glide_mask(
         df,
         S_thr_percent=S_thr_percent,
         v_min=v_min,
@@ -363,31 +453,37 @@ def process_activity_file(
         Tmin_free=Tmin_free,
     )
 
-    mu_eff = _compute_mu_eff_for_free_glide(
-        df,
-        is_free_glide=is_free,
+    # сегменти от маската (със същия праг за дължина)
+    segments = _extract_segments_from_mask(
+        is_free=is_free,
+        Tmin_seg=Tmin_free,
+    )
+
+    mu_seg_label, segments_df = _estimate_mu_per_segment(
+        df=df,
+        segments=segments,
         mu_min=mu_min,
         mu_max=mu_max,
     )
 
     df["is_free_glide"] = is_free
-    df["mu_eff"] = mu_eff
+    df["mu_seg_label"] = mu_seg_label
 
-    valid_mu = mu_eff.dropna()
-    n_valid = int(valid_mu.shape[0])
-
-    if n_valid == 0:
+    if segments_df.empty:
         raise ValueError(
-            "Няма валидни секунди за изчисляване на μ_eff (провери параметрите)."
+            "Няма валидни free-glide сегменти за изчисляване на μ (провери параметрите)."
         )
 
-    mu_session = float(valid_mu.median())
+    # медиана на μ_seg по сегменти
+    mu_session = float(segments_df["mu_seg"].median())
+    n_valid_seconds = int(segments_df["duration_s"].sum())
 
     result = {
         "name": filename,
         "df": df,
         "mu_session": mu_session,
-        "n_valid": n_valid,
+        "n_valid": n_valid_seconds,
+        "segments": segments_df,
         "FI": None,
         "K": None,
     }
