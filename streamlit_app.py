@@ -6,21 +6,12 @@ import pandas as pd
 import streamlit as st
 from statsmodels.nonparametric.smoothers_lowess import lowess
 
-# ---------------------------------------------------------
-# CONFIG
-# ---------------------------------------------------------
-
-G = 9.80665   # gravitational acceleration
-
-st.set_page_config(page_title="onFlows — Glide Coefficient μ_eff", layout="wide")
+st.set_page_config(page_title="onFlows — Glide / Resistance Index", layout="wide")
 
 
-# ---------------------------------------------------------
-# TCX PARSER
-# ---------------------------------------------------------
+# ---------- TCX parser ----------
 
 def parse_tcx(file_obj) -> pd.DataFrame:
-    """Reads TCX file → returns DataFrame with time, distance, altitude, speed."""
     data = file_obj.read()
     tree = ET.parse(io.BytesIO(data))
     root = tree.getroot()
@@ -55,12 +46,9 @@ def parse_tcx(file_obj) -> pd.DataFrame:
     return df
 
 
-# ---------------------------------------------------------
-# SMOOTHING + GRADIENT + ACCELERATION
-# ---------------------------------------------------------
+# ---------- helpers ----------
 
 def central_diff(y, x):
-    """Central difference derivative with edge handling."""
     dy = np.zeros_like(y)
     dx = np.zeros_like(y)
 
@@ -76,208 +64,233 @@ def central_diff(y, x):
     return dy / dx
 
 
-def process_df(df, frac=0.02):
-    """Smooth altitude, distance, speed; compute grade and acceleration."""
+def smooth_and_grade(df, frac=0.02):
     t = df["t_sec"].values
 
-    # smoothing (LOWESS)
     df["alt_smooth"] = lowess(df["altitude_m"], t, frac=frac, return_sorted=False)
     df["dist_smooth"] = lowess(df["distance_m"], t, frac=frac, return_sorted=False)
     df["speed_smooth"] = lowess(df["speed"], t, frac=frac, return_sorted=False)
 
-    # derivatives
     dalt_dt = central_diff(df["alt_smooth"].values, t)
     ddist_dt = central_diff(df["dist_smooth"].values, t)
-    dspeed_dt = central_diff(df["speed_smooth"].values, t)
 
-    # grade % = (dh/ds) * 100
-    raw_grade = (dalt_dt / ddist_dt) * 100
+    raw_grade = (dalt_dt / ddist_dt) * 100.0
     df["grade"] = lowess(raw_grade, t, frac=0.05, return_sorted=False)
-
-    # acceleration
-    raw_acc = dspeed_dt
-    df["acc"] = lowess(raw_acc, t, frac=0.05, return_sorted=False)
 
     return df
 
 
-# ---------------------------------------------------------
-# STEADY-STATE FILTER
-# ---------------------------------------------------------
-
-def filter_steady_state(df, acc_threshold=0.05):
-    """Return only points with |acc| < threshold."""
-    mask = np.abs(df["acc"]) < acc_threshold
-    return df[mask]
-
-
-# ---------------------------------------------------------
-# μ_eff COMPUTATION VIA SPEED–GRADE REGRESSION (numpy.polyfit)
-# ---------------------------------------------------------
-
-def compute_mu_eff(df_ss):
+def extract_downhill_points(
+    df,
+    grade_threshold=-1.0,
+    min_segment_duration=10.0,
+    cut_first=5.0,
+):
     """
-    Compute μ_eff using linear regression with numpy.polyfit:
-        speed = c1 * grade + c0
-    μ_eff = |grade_zero| / 100
-    where grade_zero = -c0 / c1
+    Връща само точки от спускания:
+    - grade < grade_threshold (напр. -1%)
+    - сегменти с минимална дължина
+    - от всеки сегмент се махат първите cut_first секунди
     """
-    if len(df_ss) < 50:
-        return np.nan, np.nan, np.nan
+    t = df["t_sec"].values
+    grade = df["grade"].values
 
-    x = df_ss["grade"].values
-    y = df_ss["speed_smooth"].values
+    downhill_mask = grade < grade_threshold
 
-    # guard against NaNs
-    mask = np.isfinite(x) & np.isfinite(y)
-    x = x[mask]
-    y = y[mask]
+    if not downhill_mask.any():
+        return df.iloc[0:0]  # празен DF
 
-    if len(x) < 10:
-        return np.nan, np.nan, np.nan
+    idx = np.where(downhill_mask)[0]
+    start = idx[0]
+    prev = idx[0]
+    segments = []
 
-    # linear fit: y = c1*x + c0
-    c1, c0 = np.polyfit(x, y, 1)
+    for i in idx[1:]:
+        if i == prev + 1:
+            prev = i
+            continue
+        segments.append((start, prev))
+        start = i
+        prev = i
+    segments.append((start, prev))
 
-    if c1 == 0:
-        return np.nan, c0, c1
+    keep_mask = np.zeros_like(t, dtype=bool)
 
-    grade_zero = -c0 / c1  # % grade where speed = 0
-    mu_eff = abs(grade_zero) / 100.0
+    for s_idx, e_idx in segments:
+        t_start = t[s_idx]
+        t_end = t[e_idx]
+        duration = t_end - t_start
+        if duration < min_segment_duration:
+            continue
 
-    return mu_eff, c0, c1
+        t_cut = t_start + cut_first
+        seg_idx = np.arange(len(t))
+        m = (seg_idx >= s_idx) & (seg_idx <= e_idx) & (t >= t_cut)
+        keep_mask |= m
+
+    return df[keep_mask]
 
 
-# ---------------------------------------------------------
-# STREAMLIT UI
-# ---------------------------------------------------------
+def time_weighted_mean(series, t_sec):
+    """Времево претеглена средна стойност."""
+    if len(series) < 2:
+        return np.nan
+
+    t = t_sec.values
+    dt = np.diff(t)
+    # последната точка – ползваме последното dt
+    dt = np.append(dt, dt[-1])
+
+    weights = dt
+    x = series.values
+
+    mask = np.isfinite(x) & np.isfinite(weights)
+    if mask.sum() == 0:
+        return np.nan
+
+    return np.sum(x[mask] * weights[mask]) / np.sum(weights[mask])
+
+
+# ---------- Streamlit UI ----------
 
 def main():
-
-    st.title("onFlows — Steady-State Glide Coefficient (μ_eff)")
+    st.title("onFlows — Glide / Resistance Index (интуитивен модел)")
 
     st.markdown("""
-    **Steady-state модел за измерване на плазгаемост / съпротивление (μ_eff).**  
-    Работи чрез регресия между скорост и наклон, само в участъци с почти нулево ускорение.
-    """)
+Измерваме **плазгаемостта** на снега / ролките по *интуитивен* начин:
+
+- Избираме само **истинските спускания** (grade < праг)  
+- Махаме първите X секунди от всяко спускане  
+- Вземаме **средната скорост на спусканията** и **средния наклон**  
+- От тях изчисляваме:
+    - **Glide Index (GI)** – колкото е по-голям, толкова по-бързо „плузга“  
+    - **Resistance Index (RI = 1 / GI)** – по-голям → по-голямо съпротивление
+""")
 
     uploaded_files = st.file_uploader(
-        "Качи един или няколко TCX файла",
+        "Качи един или няколко TCX файла от една и съща писта",
         type=["tcx"],
-        accept_multiple_files=True
+        accept_multiple_files=True,
     )
 
     if not uploaded_files:
-        st.info("Качи поне един файл.")
+        st.info("Качи поне един TCX файл.")
         return
 
-    # Sidebar controls
-    st.sidebar.header("Параметри")
-    acc_threshold = st.sidebar.slider(
-        "Steady-state праг за ускорение |a| < (m/s²)",
-        min_value=0.01, max_value=0.20, value=0.05, step=0.01
+    st.sidebar.header("Критерии за спусканията")
+
+    grade_threshold = st.sidebar.number_input(
+        "Максимален наклон за спускане (grade < ... %)",
+        min_value=-30.0, max_value=0.0, value=-1.0, step=0.5,
+    )
+
+    min_seg_dur = st.sidebar.number_input(
+        "Минимална дължина на сегмента (s)",
+        min_value=5.0, max_value=120.0, value=10.0, step=1.0,
+    )
+
+    cut_first = st.sidebar.number_input(
+        "Изрязване на първите X секунди от всяко спускане",
+        min_value=0.0, max_value=30.0, value=5.0, step=1.0,
     )
 
     smooth_frac = st.sidebar.slider(
         "Степен на изглаждане (LOWESS frac)",
-        min_value=0.01, max_value=0.20, value=0.02, step=0.01
+        min_value=0.01, max_value=0.20, value=0.02, step=0.01,
     )
 
-    # Results store
-    results = {}
+    results = []
 
     for file in uploaded_files:
         try:
             df_raw = parse_tcx(file)
-            df = process_df(df_raw, frac=smooth_frac)
-            df_ss = filter_steady_state(df, acc_threshold)
+            df = smooth_and_grade(df_raw, frac=smooth_frac)
+            df_down = extract_downhill_points(
+                df,
+                grade_threshold=grade_threshold,
+                min_segment_duration=min_seg_dur,
+                cut_first=cut_first,
+            )
 
-            mu_eff, c0, c1 = compute_mu_eff(df_ss)
+            if df_down.empty:
+                v_mean = np.nan
+                g_mean = np.nan
+                gi = np.nan
+                ri = np.nan
+            else:
+                v_mean = time_weighted_mean(df_down["speed_smooth"], df_down["t_sec"])
+                g_mean = time_weighted_mean(df_down["grade"], df_down["t_sec"])
 
-            results[file.name] = {
-                "df": df,
-                "df_ss": df_ss,
-                "mu": mu_eff,
-                "c0": c0,
-                "c1": c1,
-            }
+                # v_mean в m/s → km/h за по-интуитивно
+                v_mean_kmh = v_mean * 3.6
 
+                if g_mean >= 0 or np.isnan(g_mean) or np.isnan(v_mean):
+                    gi = np.nan
+                    ri = np.nan
+                else:
+                    gi = v_mean_kmh / np.sqrt(abs(g_mean))   # Glide Index
+                    ri = 1.0 / gi                             # Resistance Index
+
+            results.append({
+                "activity": file.name,
+                "downhill_points": len(df_down),
+                "mean_down_speed_kmh": v_mean * 3.6 if not np.isnan(v_mean) else np.nan,
+                "mean_down_grade_%": g_mean,
+                "GlideIndex_GI": gi,
+                "ResistanceIndex_RI": ri,
+            })
         except Exception as e:
             st.error(f"Грешка при обработка на {file.name}: {e}")
 
-    # Summary table
-    st.subheader("Резултати по активности")
+    res_df = pd.DataFrame(results)
 
-    summary_rows = []
-    for name, obj in results.items():
-        summary_rows.append(
-            {
-                "активност": name,
-                "μ_eff": obj["mu"],
-                "c0 (intercept)": obj["c0"],
-                "c1 (slope)": obj["c1"],
-                "steady-state точки": len(obj["df_ss"])
-            }
-        )
-
-    st.dataframe(pd.DataFrame(summary_rows).style.format({
-        "μ_eff": "{:.4f}",
-        "c0 (intercept)": "{:.3f}",
-        "c1 (slope)": "{:.3f}",
-    }))
-
-    # Graph viewer
-    selected_name = st.selectbox(
-        "Избери активност за визуализация",
-        list(results.keys())
+    st.subheader("Резюме по активности")
+    st.dataframe(
+        res_df.style.format({
+            "mean_down_speed_kmh": "{:.2f}",
+            "mean_down_grade_%": "{:.2f}",
+            "GlideIndex_GI": "{:.3f}",
+            "ResistanceIndex_RI": "{:.3f}",
+        })
     )
-    obj = results[selected_name]
 
-    df = obj["df"]
-    df_ss = obj["df_ss"]
-    mu_eff = obj["mu"]
-    c0, c1 = obj["c0"], obj["c1"]
+    # Визуализация за избрана активност
+    selected = st.selectbox(
+        "Избери активност за детайлна графика",
+        res_df["activity"].tolist()
+    )
 
-    st.subheader(f"Графики — {selected_name}")
+    file_obj = next(f for f in uploaded_files if f.name == selected)
+    df_raw = parse_tcx(file_obj)
+    df = smooth_and_grade(df_raw, frac=smooth_frac)
+    df_down = extract_downhill_points(
+        df,
+        grade_threshold=grade_threshold,
+        min_segment_duration=min_seg_dur,
+        cut_first=cut_first,
+    )
 
-    # 1) Скорост/наклон/ускорение по време (по желание)
-    with st.expander("Времеви графики (speed / grade / acc)"):
-        st.line_chart(df.set_index("t_sec")[["speed_smooth"]].rename(
-            columns={"speed_smooth": "speed (m/s)"}))
-        st.line_chart(df.set_index("t_sec")[["grade"]].rename(
-            columns={"grade": "grade (%)"}))
-        st.line_chart(df.set_index("t_sec")[["acc"]].rename(
-            columns={"acc": "acc (m/s²)"}))
+    st.subheader(f"Графики — {selected}")
 
-    # 2) Speed vs Grade (steady-state)
-    st.markdown("### Speed vs Grade (Steady-State точки + регресионна права)")
-
-    if not np.isnan(mu_eff) and len(df_ss) > 0 and not np.isnan(c1):
-        # scatter
-        scatter_df = df_ss[["grade", "speed_smooth"]].rename(
-            columns={"grade": "grade", "speed_smooth": "speed"}
+    with st.expander("Времеви графики (speed / grade)"):
+        st.line_chart(
+            df.set_index("t_sec")[["speed_smooth"]].rename(
+                columns={"speed_smooth": "speed (m/s)"}
+            )
         )
-        st.scatter_chart(scatter_df, x="grade", y="speed")
-
-        # regression line
-        x_min = np.nanmin(df_ss["grade"])
-        x_max = np.nanmax(df_ss["grade"])
-        x_line = np.linspace(x_min, x_max, 200)
-        y_line = c1 * x_line + c0
-
-        line_df = pd.DataFrame({"grade": x_line, "speed_reg": y_line}).set_index("grade")
-        st.line_chart(line_df)
-
-        st.markdown(
-            f"**μ_eff = {mu_eff:.4f}**  "
-            f"(grade_zero = {-c0 / c1:.2f} %,  c0 = {c0:.3f},  c1 = {c1:.3f})"
+        st.line_chart(
+            df.set_index("t_sec")[["grade"]].rename(
+                columns={"grade": "grade (%)"}
+            )
         )
-        st.caption(
-            "μ_eff = |grade_zero| / 100, където grade_zero е наклонът, "
-            "при който регресионната скорост става 0."
-        )
+
+    if not df_down.empty:
+        st.markdown("**Точки от спусканията (speed vs grade):**")
+        scatter_df = df_down[["grade", "speed_smooth"]].copy()
+        scatter_df["speed_kmh"] = scatter_df["speed_smooth"] * 3.6
+        st.scatter_chart(scatter_df, x="grade", y="speed_kmh")
     else:
-        st.warning("Недостатъчно steady-state точки или неуспешна регресия за тази активност.")
+        st.info("Няма намерени точки от спускане за тази активност с дадените критерии.")
 
 
 if __name__ == "__main__":
