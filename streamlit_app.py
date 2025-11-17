@@ -6,6 +6,7 @@ import pandas as pd
 import streamlit as st
 from statsmodels.nonparametric.smoothers_lowess import lowess
 
+
 # ----------------- Помощни функции ----------------- #
 
 def parse_tcx(file_obj) -> pd.DataFrame:
@@ -100,17 +101,20 @@ def find_downhill_segments(
     df: pd.DataFrame,
     min_total_duration_s: float = 10.0,
     cut_first_s: float = 5.0,
+    grade_threshold: float = 0.0,
 ) -> pd.DataFrame:
     """
-    Намира сегменти с наклон < 0% (спускания),
+    Намира сегменти с наклон < grade_threshold (напр. -1%),
     реже първите cut_first_s секунди,
-    и дава таблица със САМО реалното ускорение и наклон (средни за сегмента).
+    и дава таблица със средно реално ускорение и наклон за всеки сегмент.
     """
     t = df["t_sec"].values
     grade = df["grade_percent"].values
     acc = df["acc_m_s2"].values
 
-    downhill_mask = grade < 0.0
+    # тук вече използваме параметъра от UI
+    downhill_mask = grade < grade_threshold
+
     segments = []
 
     if not downhill_mask.any():
@@ -188,11 +192,11 @@ def main():
     st.markdown(
         """
 Тази версия:
-- Изглажда скорост, височина и дистанция (LOWESS тренд)
-- Изчислява наклон (%) и ускорение **по тренда**
-- Намира само участъци със спускане (**grade < 0%**)
-- Прилага старите критерии: минимум 10 s, маха първите 5 s от всеки участък
-- Показва само **реално ускорение и наклон** за тези сегменти
+- Изглажда скорост, височина и дистанция (LOWESS тренд)  
+- Изчислява наклон (%) и ускорение по тренда  
+- Намира участъци със спускане според критерии, които задаваш ти  
+- Показва **средно реално ускорение** и **среден наклон** по сегмент  
+- Показва и **общо средни стойности** за всички сегменти в избрания файл
 """
     )
 
@@ -206,8 +210,9 @@ def main():
         st.info("Качи поне един TCX файл.")
         return
 
-    # Параметри на сегментите – можеш да ги променяш от UI
+    # Параметри на сегментите – вече с граница за наклона
     st.sidebar.header("Критерии за спусканията")
+
     min_duration = st.sidebar.number_input(
         "Минимална дължина на сегмента (s)",
         min_value=5.0,
@@ -215,6 +220,7 @@ def main():
         value=10.0,
         step=1.0,
     )
+
     cut_first = st.sidebar.number_input(
         "Изрязване на първите (s) от всеки сегмент",
         min_value=0.0,
@@ -223,13 +229,37 @@ def main():
         step=1.0,
     )
 
+    grade_threshold = st.sidebar.number_input(
+        "Максимален наклон за спускане (%) "
+        "(пример: 0.0 = всички <0%, -1.0 = само под -1%)",
+        min_value=-30.0,
+        max_value=5.0,
+        value=0.0,
+        step=0.5,
+    )
+
+    st.sidebar.markdown(
+        f"""
+**Избрани критерии:**
+
+- Наклон: сегменти с grade `< {grade_threshold:.1f} %`  
+- Минимална дължина: `{min_duration:.1f} s`  
+- Изрязване в началото: `{cut_first:.1f} s`
+"""
+    )
+
     results = {}  # filename -> (df_proc, seg_df)
 
     for file in uploaded_files:
         try:
             df_raw = parse_tcx(file)
             df_proc = process_df(df_raw)
-            seg_df = find_downhill_segments(df_proc, min_duration, cut_first)
+            seg_df = find_downhill_segments(
+                df_proc,
+                min_total_duration_s=min_duration,
+                cut_first_s=cut_first,
+                grade_threshold=grade_threshold,
+            )
             results[file.name] = (df_proc, seg_df)
         except Exception as e:
             st.error(f"Грешка при обработка на {file.name}: {e}")
@@ -264,7 +294,7 @@ def main():
     if seg_df.empty:
         st.info(
             "Не са намерени сегменти, които да отговарят на критериите "
-            f"(наклон < 0%, дължина ≥ {min_duration}s)."
+            f"(grade < {grade_threshold:.1f}%, дължина ≥ {min_duration:.1f}s)."
         )
     else:
         st.dataframe(
@@ -277,7 +307,20 @@ def main():
             )
         )
 
-    # Експорт на пълните изгладени данни
+        # Общо средни стойности за всички сегменти
+        overall_mean_grade = seg_df["mean_grade_percent"].mean()
+        overall_mean_acc = seg_df["mean_acc_m_s2"].mean()
+
+        st.markdown(
+            f"""
+**Общо средни стойности за този файл (по всички намерени сегменти):**
+
+- Среден наклон: **{overall_mean_grade:.2f} %**  
+- Средно ускорение: **{overall_mean_acc:.3f} m/s²**
+"""
+        )
+
+    # Експорт на изгладените данни
     st.subheader("Експорт на изгладените данни за избрания файл")
     csv_bytes = df_proc.to_csv(index=False).encode("utf-8")
     st.download_button(
@@ -290,4 +333,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
