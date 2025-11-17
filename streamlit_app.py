@@ -6,7 +6,7 @@ import pandas as pd
 import streamlit as st
 from statsmodels.nonparametric.smoothers_lowess import lowess
 
-st.set_page_config(page_title="onFlows — Flat Glide Index (FGNS)", layout="wide")
+st.set_page_config(page_title="onFlows — Mechanical Power (from TCX)", layout="wide")
 
 
 # ---------- TCX parser ----------
@@ -68,9 +68,9 @@ def central_diff(y, x):
     return dy / dx
 
 
-def smooth_and_grade(df: pd.DataFrame, frac: float = 0.02) -> pd.DataFrame:
+def smooth_and_kin(df: pd.DataFrame, frac: float = 0.02) -> pd.DataFrame:
     """
-    LOWESS изглаждане на височина, дистанция, скорост + наклон (%).
+    LOWESS изглаждане на височина, дистанция, скорост + наклон (%) и ускорение.
     """
     t = df["t_sec"].values
 
@@ -80,63 +80,51 @@ def smooth_and_grade(df: pd.DataFrame, frac: float = 0.02) -> pd.DataFrame:
 
     dalt_dt = central_diff(df["alt_smooth"].values, t)
     ddist_dt = central_diff(df["dist_smooth"].values, t)
+    dspeed_dt = central_diff(df["speed_smooth"].values, t)
 
-    raw_grade = (dalt_dt / ddist_dt) * 100.0  # %
+    # наклон (%)
+    raw_grade = (dalt_dt / ddist_dt) * 100.0
     df["grade"] = lowess(raw_grade, t, frac=0.05, return_sorted=False)
+
+    # ускорение (m/s^2)
+    df["acc"] = lowess(dspeed_dt, t, frac=0.05, return_sorted=False)
 
     return df
 
 
-def extract_flat_points(
-    df: pd.DataFrame,
-    grade_abs_thresh: float = 0.3,
-    min_segment_duration: float = 6.0,
-) -> pd.DataFrame:
+def compute_mechanical_power(df: pd.DataFrame, mass_kg: float) -> pd.DataFrame:
     """
-    Връща точки от *равни* участъци:
-    - |grade| < grade_abs_thresh (напр. 0.3 %)
-    - всеки сегмент трябва да е с продължителност ≥ min_segment_duration
+    P_grav = m g v grade/100 (само ако grade>0)
+    P_kin  = m a v (само ако a>0)
+    P_mech = P_grav_pos + P_kin_pos
     """
-    t = df["t_sec"].values
-    grade = df["grade"].values
+    g = 9.80665
 
-    flat_mask = np.abs(grade) < grade_abs_thresh
+    v = df["speed_smooth"].values      # m/s
+    grade_frac = df["grade"].values / 100.0
+    a = df["acc"].values
 
-    if not flat_mask.any():
-        return df.iloc[0:0]
+    # мощност срещу гравитацията
+    P_grav = mass_kg * g * v * grade_frac
+    P_grav_pos = np.maximum(P_grav, 0.0)
 
-    idx = np.where(flat_mask)[0]
-    start = idx[0]
-    prev = idx[0]
-    segments = []
+    # мощност за ускоряване
+    a_pos = np.maximum(a, 0.0)
+    P_kin = mass_kg * a_pos * v
 
-    for i in idx[1:]:
-        if i == prev + 1:
-            prev = i
-            continue
-        segments.append((start, prev))
-        start = i
-        prev = i
-    segments.append((start, prev))
+    P_mech = P_grav_pos + P_kin
 
-    keep_mask = np.zeros_like(t, dtype=bool)
+    df["P_grav_W"] = P_grav_pos
+    df["P_kin_W"] = P_kin
+    df["P_mech_W"] = P_mech
+    df["P_mech_Wkg"] = df["P_mech_W"] / mass_kg
 
-    for s_idx, e_idx in segments:
-        t_start = t[s_idx]
-        t_end = t[e_idx]
-        duration = t_end - t_start
-        if duration < min_segment_duration:
-            continue
-        seg_idx = np.arange(len(t))
-        m = (seg_idx >= s_idx) & (seg_idx <= e_idx)
-        keep_mask |= m
-
-    return df[keep_mask]
+    return df
 
 
 def time_weighted_mean(series: pd.Series, t_sec: pd.Series) -> float:
     """
-    Времево претеглена средна стойност.
+    Времево претеглена средна мощност.
     """
     if len(series) < 2:
         return np.nan
@@ -158,23 +146,24 @@ def time_weighted_mean(series: pd.Series, t_sec: pd.Series) -> float:
 # ---------- Streamlit UI ----------
 
 def main():
-    st.title("onFlows — Flat-Glide Normalized Speed (FGNS)")
+    st.title("onFlows — Механична мощност от TCX (гравитация + ускорение)")
 
     st.markdown(
         """
-Модел за оценка на **плазгаемостта** само от **равните участъци**, където GPS данните
-са най-стабилни.
+Това приложение изчислява **минималната положителна механична мощност** на спортиста
+според профила на скоростта и наклона:
 
-За всяка активност:
-- намираме равни сегменти (|grade| под праг)  
-- изчисляваме средна скорост на тези сегменти  
-- коригираме скоростта спрямо малкото остатъчно наклонче  
-- получаваме **Flat-Glide Normalized Speed (FGNS)** – по-висока стойност = по-бързо плъзгане.
+- **P_grav** – мощност за преодоляване на изкачванията  
+- **P_kin** – мощност за ускорения  
+- **P_mech = P_grav + P_kin** (само положителната част)  
+
+Не включва триене и въздушно съпротивление, така че стойностите са по-скоро
+*минимална необходима механична мощност*, но са полезни за сравнение между активности.
 """
     )
 
     uploaded_files = st.file_uploader(
-        "Качи един или няколко TCX файла (желателно от една и съща писта)",
+        "Качи един или няколко TCX файла",
         type=["tcx"],
         accept_multiple_files=True,
     )
@@ -183,21 +172,13 @@ def main():
         st.info("Качи поне един TCX файл.")
         return
 
-    st.sidebar.header("Параметри за равните участъци")
+    st.sidebar.header("Параметри на модела")
 
-    grade_abs_thresh = st.sidebar.number_input(
-        "Максимален абсолютен наклон |grade| < (в %)",
-        min_value=0.05,
-        max_value=2.0,
-        value=0.3,
-        step=0.05,
-    )
-
-    min_seg_dur = st.sidebar.number_input(
-        "Минимална дължина на равен сегмент (s)",
-        min_value=3.0,
-        max_value=60.0,
-        value=6.0,
+    mass_kg = st.sidebar.number_input(
+        "Тегло на спортиста (kg)",
+        min_value=40.0,
+        max_value=120.0,
+        value=70.0,
         step=1.0,
     )
 
@@ -209,121 +190,90 @@ def main():
         step=0.01,
     )
 
-    # коефициент за корекция на скоростта спрямо наклона (m/s на 1% grade)
-    slope_coef = st.sidebar.number_input(
-        "Корекция на скоростта спрямо наклон (m/s на 1% grade)",
-        min_value=0.0,
-        max_value=0.20,
-        value=0.04,  # емпирична стойност, можеш да я нагласиш
-        step=0.01,
-    )
-
     results = {}
 
     for file in uploaded_files:
         try:
-            data = file.read()  # четем bytes САМО веднъж
+            data = file.read()
             df_raw = parse_tcx_bytes(data)
-            df = smooth_and_grade(df_raw, frac=smooth_frac)
-            df_flat = extract_flat_points(
-                df,
-                grade_abs_thresh=grade_abs_thresh,
-                min_segment_duration=min_seg_dur,
-            )
+            df = smooth_and_kin(df_raw, frac=smooth_frac)
+            df = compute_mechanical_power(df, mass_kg)
 
-            if df_flat.empty:
-                flat_speed = np.nan
-                flat_grade = np.nan
-                fgns = np.nan
-            else:
-                flat_speed = time_weighted_mean(
-                    df_flat["speed_smooth"], df_flat["t_sec"]
-                )  # m/s
-                flat_grade = time_weighted_mean(
-                    df_flat["grade"], df_flat["t_sec"]
-                )  # %
-
-                # коригирана скорост към идеално равно (grade=0)
-                corrected_speed = df_flat["speed_smooth"] - slope_coef * df_flat["grade"]
-                fgns = time_weighted_mean(corrected_speed, df_flat["t_sec"])  # m/s
+            # времево претеглени средни стойности
+            mean_P = time_weighted_mean(df["P_mech_W"], df["t_sec"])
+            mean_Pkg = time_weighted_mean(df["P_mech_Wkg"], df["t_sec"])
+            mean_Pgrav = time_weighted_mean(df["P_grav_W"], df["t_sec"])
+            mean_Pkin = time_weighted_mean(df["P_kin_W"], df["t_sec"])
 
             results[file.name] = {
                 "df": df,
-                "df_flat": df_flat,
-                "flat_speed_m_s": flat_speed,
-                "flat_grade_%": flat_grade,
-                "FGNS_m_s": fgns,
+                "mean_P": mean_P,
+                "mean_Pkg": mean_Pkg,
+                "mean_Pgrav": mean_Pgrav,
+                "mean_Pkin": mean_Pkin,
             }
 
         except Exception as e:
             st.error(f"Грешка при обработка на {file.name}: {e}")
 
-    # --- Резюме ---
+    # Резюме таблица
     rows = []
     for name, obj in results.items():
-        flat_speed_kmh = (
-            obj["flat_speed_m_s"] * 3.6 if not np.isnan(obj["flat_speed_m_s"]) else np.nan
-        )
-        fgns_kmh = obj["FGNS_m_s"] * 3.6 if not np.isnan(obj["FGNS_m_s"]) else np.nan
-
         rows.append(
             {
                 "activity": name,
-                "flat_points": len(obj["df_flat"]),
-                "mean_flat_speed_kmh": flat_speed_kmh,
-                "mean_flat_grade_%": obj["flat_grade_%"],
-                "FGNS_kmh": fgns_kmh,
-                "GlideIndex_GI": fgns_kmh,
-                "ResistanceIndex_RI": 1.0 / fgns_kmh if fgns_kmh and not np.isnan(fgns_kmh) else np.nan,
+                "mean_P_W": obj["mean_P"],
+                "mean_P_Wkg": obj["mean_Pkg"],
+                "mean_P_grav_W": obj["mean_Pgrav"],
+                "mean_P_kin_W": obj["mean_Pkin"],
             }
         )
 
     res_df = pd.DataFrame(rows)
 
-    st.subheader("Резюме по активности (колкото по-голям FGNS / GI → толкова по-бързо плъзгане)")
+    st.subheader("Резюме по активности (механична мощност)")
     st.dataframe(
         res_df.style.format(
             {
-                "mean_flat_speed_kmh": "{:.2f}",
-                "mean_flat_grade_%": "{:.2f}",
-                "FGNS_kmh": "{:.2f}",
-                "GlideIndex_GI": "{:.2f}",
-                "ResistanceIndex_RI": "{:.3f}",
+                "mean_P_W": "{:.1f}",
+                "mean_P_Wkg": "{:.2f}",
+                "mean_P_grav_W": "{:.1f}",
+                "mean_P_kin_W": "{:.1f}",
             }
         )
     )
 
-    # --- Детайлна визуализация за избрана активност ---
+    # Детайлна визуализация
     selected = st.selectbox(
         "Избери активност за детайлна графика",
         res_df["activity"].tolist(),
     )
 
-    obj = results[selected]
-    df = obj["df"]
-    df_flat = obj["df_flat"]
+    df_sel = results[selected]["df"]
 
     st.subheader(f"Графики — {selected}")
 
-    with st.expander("Времеви графики (speed / grade)"):
+    with st.expander("Скорост, наклон и ускорение"):
         st.line_chart(
-            df.set_index("t_sec")[["speed_smooth"]].rename(
+            df_sel.set_index("t_sec")[["speed_smooth"]].rename(
                 columns={"speed_smooth": "speed (m/s)"}
             )
         )
         st.line_chart(
-            df.set_index("t_sec")[["grade"]].rename(columns={"grade": "grade (%)"})
+            df_sel.set_index("t_sec")[["grade"]].rename(columns={"grade": "grade (%)"})
+        )
+        st.line_chart(
+            df_sel.set_index("t_sec")[["acc"]].rename(columns={"acc": "acc (m/s²)"})
         )
 
-    if not df_flat.empty:
-        st.markdown("**Точки от равните участъци (speed vs grade):**")
-        scatter_df = df_flat[["grade", "speed_smooth"]].copy()
-        scatter_df["speed_kmh"] = scatter_df["speed_smooth"] * 3.6
-        st.scatter_chart(scatter_df, x="grade", y="speed_kmh")
-    else:
-        st.info(
-            "За тази активност няма равни сегменти, които да отговарят на критериите."
-        )
+    st.markdown("**Механична мощност във времето (W и W/kg):**")
+    power_plot = df_sel.set_index("t_sec")[["P_mech_W", "P_mech_Wkg"]]
+    st.line_chart(power_plot)
+
+    st.caption(
+        "Важно: това е минимална външна механична мощност (само гравитация + ускорения). "
+        "Реалната метаболитна мощност е по-висока заради триене, въздух и енергийни загуби."
+    )
 
 
 if __name__ == "__main__":
