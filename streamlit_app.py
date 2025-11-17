@@ -11,8 +11,8 @@ st.set_page_config(page_title="onFlows — Glide / Resistance Index", layout="wi
 
 # ---------- TCX parser ----------
 
-def parse_tcx(file_obj) -> pd.DataFrame:
-    data = file_obj.read()
+def parse_tcx_bytes(data: bytes) -> pd.DataFrame:
+    """Парсва TCX от bytes → DataFrame с time, distance, altitude, speed."""
     tree = ET.parse(io.BytesIO(data))
     root = tree.getroot()
 
@@ -138,8 +138,7 @@ def time_weighted_mean(series, t_sec):
 
     t = t_sec.values
     dt = np.diff(t)
-    # последната точка – ползваме последното dt
-    dt = np.append(dt, dt[-1])
+    dt = np.append(dt, dt[-1])  # последната точка
 
     weights = dt
     x = series.values
@@ -157,13 +156,13 @@ def main():
     st.title("onFlows — Glide / Resistance Index (интуитивен модел)")
 
     st.markdown("""
-Измерваме **плазгаемостта** на снега / ролките по *интуитивен* начин:
+Измерваме **плазгаемостта** на снега / ролките по интуитивен начин:
 
-- Избираме само **истинските спускания** (grade < праг)  
+- Избираме само **истинските спускания** (grade под зададен праг)  
 - Махаме първите X секунди от всяко спускане  
 - Вземаме **средната скорост на спусканията** и **средния наклон**  
 - От тях изчисляваме:
-    - **Glide Index (GI)** – колкото е по-голям, толкова по-бързо „плузга“  
+    - **Glide Index (GI)** – по-голям → по-бърз сняг / по-малко съпротивление  
     - **Resistance Index (RI = 1 / GI)** – по-голям → по-голямо съпротивление
 """)
 
@@ -199,11 +198,13 @@ def main():
         min_value=0.01, max_value=0.20, value=0.02, step=0.01,
     )
 
-    results = []
+    # Тук ще пазим всичко по име на файл
+    results = {}
 
     for file in uploaded_files:
         try:
-            df_raw = parse_tcx(file)
+            data = file.read()              # четем байтовете САМО веднъж
+            df_raw = parse_tcx_bytes(data)  # парсваме от bytes
             df = smooth_and_grade(df_raw, frac=smooth_frac)
             df_down = extract_downhill_points(
                 df,
@@ -221,28 +222,40 @@ def main():
                 v_mean = time_weighted_mean(df_down["speed_smooth"], df_down["t_sec"])
                 g_mean = time_weighted_mean(df_down["grade"], df_down["t_sec"])
 
-                # v_mean в m/s → km/h за по-интуитивно
-                v_mean_kmh = v_mean * 3.6
-
-                if g_mean >= 0 or np.isnan(g_mean) or np.isnan(v_mean):
+                if np.isnan(v_mean) or np.isnan(g_mean) or g_mean >= 0:
                     gi = np.nan
                     ri = np.nan
                 else:
+                    v_mean_kmh = v_mean * 3.6
                     gi = v_mean_kmh / np.sqrt(abs(g_mean))   # Glide Index
                     ri = 1.0 / gi                             # Resistance Index
 
-            results.append({
-                "activity": file.name,
-                "downhill_points": len(df_down),
-                "mean_down_speed_kmh": v_mean * 3.6 if not np.isnan(v_mean) else np.nan,
-                "mean_down_grade_%": g_mean,
-                "GlideIndex_GI": gi,
-                "ResistanceIndex_RI": ri,
-            })
+            results[file.name] = {
+                "df_raw": df_raw,
+                "df": df,
+                "df_down": df_down,
+                "v_mean": v_mean,
+                "g_mean": g_mean,
+                "GI": gi,
+                "RI": ri,
+            }
+
         except Exception as e:
             st.error(f"Грешка при обработка на {file.name}: {e}")
 
-    res_df = pd.DataFrame(results)
+    # Резюме
+    rows = []
+    for name, obj in results.items():
+        rows.append({
+            "activity": name,
+            "downhill_points": len(obj["df_down"]),
+            "mean_down_speed_kmh": obj["v_mean"] * 3.6 if not np.isnan(obj["v_mean"]) else np.nan,
+            "mean_down_grade_%": obj["g_mean"],
+            "GlideIndex_GI": obj["GI"],
+            "ResistanceIndex_RI": obj["RI"],
+        })
+
+    res_df = pd.DataFrame(rows)
 
     st.subheader("Резюме по активности")
     st.dataframe(
@@ -254,21 +267,15 @@ def main():
         })
     )
 
-    # Визуализация за избрана активност
+    # Детайлна графика
     selected = st.selectbox(
         "Избери активност за детайлна графика",
         res_df["activity"].tolist()
     )
 
-    file_obj = next(f for f in uploaded_files if f.name == selected)
-    df_raw = parse_tcx(file_obj)
-    df = smooth_and_grade(df_raw, frac=smooth_frac)
-    df_down = extract_downhill_points(
-        df,
-        grade_threshold=grade_threshold,
-        min_segment_duration=min_seg_dur,
-        cut_first=cut_first,
-    )
+    obj = results[selected]
+    df = obj["df"]
+    df_down = obj["df_down"]
 
     st.subheader(f"Графики — {selected}")
 
