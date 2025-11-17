@@ -5,7 +5,6 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from statsmodels.nonparametric.smoothers_lowess import lowess
-from sklearn.linear_model import LinearRegression
 
 # ---------------------------------------------------------
 # CONFIG
@@ -113,35 +112,40 @@ def filter_steady_state(df, acc_threshold=0.05):
 
 
 # ---------------------------------------------------------
-# μ_eff COMPUTATION VIA SPEED–GRADE REGRESSION
+# μ_eff COMPUTATION VIA SPEED–GRADE REGRESSION (numpy.polyfit)
 # ---------------------------------------------------------
 
 def compute_mu_eff(df_ss):
     """
-    Compute μ_eff using linear regression:
-        speed = c0 + c1 * grade
+    Compute μ_eff using linear regression with numpy.polyfit:
+        speed = c1 * grade + c0
     μ_eff = |grade_zero| / 100
     where grade_zero = -c0 / c1
     """
     if len(df_ss) < 50:
-        return np.nan, np.nan, np.nan, None
+        return np.nan, np.nan, np.nan
 
-    X = df_ss["grade"].values.reshape(-1, 1)
+    x = df_ss["grade"].values
     y = df_ss["speed_smooth"].values
 
-    model = LinearRegression()
-    model.fit(X, y)
+    # guard against NaNs
+    mask = np.isfinite(x) & np.isfinite(y)
+    x = x[mask]
+    y = y[mask]
 
-    c1 = model.coef_[0]
-    c0 = model.intercept_
+    if len(x) < 10:
+        return np.nan, np.nan, np.nan
+
+    # linear fit: y = c1*x + c0
+    c1, c0 = np.polyfit(x, y, 1)
 
     if c1 == 0:
-        return np.nan, c0, c1, model
+        return np.nan, c0, c1
 
-    grade_zero = -c0 / c1     # % grade where speed = 0
-    mu_eff = abs(grade_zero) / 100
+    grade_zero = -c0 / c1  # % grade where speed = 0
+    mu_eff = abs(grade_zero) / 100.0
 
-    return mu_eff, c0, c1, model
+    return mu_eff, c0, c1
 
 
 # ---------------------------------------------------------
@@ -151,10 +155,10 @@ def compute_mu_eff(df_ss):
 def main():
 
     st.title("onFlows — Steady-State Glide Coefficient (μ_eff)")
+
     st.markdown("""
-    **Стандартен научен модел за измерване на плазгаемост / съпротивление.**  
-    Прилага се в SkiLab тестовете и норвежката федерация.  
-    Работи чрез steady-state регресия между скорост и наклон.
+    **Steady-state модел за измерване на плазгаемост / съпротивление (μ_eff).**  
+    Работи чрез регресия между скорост и наклон, само в участъци с почти нулево ускорение.
     """)
 
     uploaded_files = st.file_uploader(
@@ -170,7 +174,7 @@ def main():
     # Sidebar controls
     st.sidebar.header("Параметри")
     acc_threshold = st.sidebar.slider(
-        "Steady-State прах за ускорение |a| < (m/s²)",
+        "Steady-state праг за ускорение |a| < (m/s²)",
         min_value=0.01, max_value=0.20, value=0.05, step=0.01
     )
 
@@ -188,7 +192,7 @@ def main():
             df = process_df(df_raw, frac=smooth_frac)
             df_ss = filter_steady_state(df, acc_threshold)
 
-            mu_eff, c0, c1, model = compute_mu_eff(df_ss)
+            mu_eff, c0, c1 = compute_mu_eff(df_ss)
 
             results[file.name] = {
                 "df": df,
@@ -196,14 +200,13 @@ def main():
                 "mu": mu_eff,
                 "c0": c0,
                 "c1": c1,
-                "model": model,
             }
 
         except Exception as e:
             st.error(f"Грешка при обработка на {file.name}: {e}")
 
-    # Show results
-    st.subheader("Резултати:")
+    # Summary table
+    st.subheader("Резултати по активности")
 
     summary_rows = []
     for name, obj in results.items():
@@ -224,7 +227,10 @@ def main():
     }))
 
     # Graph viewer
-    selected_name = st.selectbox("Избери активност за визуализация", list(results.keys()))
+    selected_name = st.selectbox(
+        "Избери активност за визуализация",
+        list(results.keys())
+    )
     obj = results[selected_name]
 
     df = obj["df"]
@@ -232,32 +238,46 @@ def main():
     mu_eff = obj["mu"]
     c0, c1 = obj["c0"], obj["c1"]
 
-    st.subheader(f"Графика — {selected_name}")
+    st.subheader(f"Графики — {selected_name}")
 
-    st.markdown("### Speed vs Grade (Steady-State Points + Regression Line)")
-    if mu_eff is not np.nan and obj["model"] is not None:
-        X_line = np.linspace(df["grade"].min(), df["grade"].max(), 200).reshape(-1, 1)
-        y_line = obj["model"].predict(X_line)
+    # 1) Скорост/наклон/ускорение по време (по желание)
+    with st.expander("Времеви графики (speed / grade / acc)"):
+        st.line_chart(df.set_index("t_sec")[["speed_smooth"]].rename(
+            columns={"speed_smooth": "speed (m/s)"}))
+        st.line_chart(df.set_index("t_sec")[["grade"]].rename(
+            columns={"grade": "grade (%)"}))
+        st.line_chart(df.set_index("t_sec")[["acc"]].rename(
+            columns={"acc": "acc (m/s²)"}))
 
-        chart_df = pd.DataFrame({
-            "grade": df_ss["grade"],
-            "speed": df_ss["speed_smooth"]
-        })
+    # 2) Speed vs Grade (steady-state)
+    st.markdown("### Speed vs Grade (Steady-State точки + регресионна права)")
 
-        st.scatter_chart(chart_df, x="grade", y="speed")
+    if not np.isnan(mu_eff) and len(df_ss) > 0 and not np.isnan(c1):
+        # scatter
+        scatter_df = df_ss[["grade", "speed_smooth"]].rename(
+            columns={"grade": "grade", "speed_smooth": "speed"}
+        )
+        st.scatter_chart(scatter_df, x="grade", y="speed")
 
-        reg_df = pd.DataFrame({
-            "grade": X_line.flatten(),
-            "speed": y_line
-        })
-        st.line_chart(reg_df.set_index("grade"))
+        # regression line
+        x_min = np.nanmin(df_ss["grade"])
+        x_max = np.nanmax(df_ss["grade"])
+        x_line = np.linspace(x_min, x_max, 200)
+        y_line = c1 * x_line + c0
 
+        line_df = pd.DataFrame({"grade": x_line, "speed_reg": y_line}).set_index("grade")
+        st.line_chart(line_df)
+
+        st.markdown(
+            f"**μ_eff = {mu_eff:.4f}**  "
+            f"(grade_zero = {-c0 / c1:.2f} %,  c0 = {c0:.3f},  c1 = {c1:.3f})"
+        )
+        st.caption(
+            "μ_eff = |grade_zero| / 100, където grade_zero е наклонът, "
+            "при който регресионната скорост става 0."
+        )
     else:
-        st.warning("Недостатъчно steady-state точки за регресия.")
-
-    st.markdown(f"### μ_eff = **{mu_eff:.4f}**")
-
-    st.markdown("""---""")
+        st.warning("Недостатъчно steady-state точки или неуспешна регресия за тази активност.")
 
 
 if __name__ == "__main__":
