@@ -15,7 +15,7 @@ MIN_ABS_DELTA_ELEV = 0.3          # под това е просто шум
 # филтри за суровите данни
 MAX_SPEED_M_S = 30.0
 MAX_ALT_RATE_M_S = 5.0            # по-реалистичен лимит
-MIN_DOWNHILL_SLOPE = -5.0         # филтър за спускане (< -5%)
+MIN_DOWNHILL_SLOPE = -7.0         # филтър за спускане (< -5%)
 
 # ---- ПАРСВАНЕ ----
 def parse_tcx(file) -> pd.DataFrame:
