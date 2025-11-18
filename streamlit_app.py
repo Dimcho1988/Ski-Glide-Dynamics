@@ -4,20 +4,26 @@ import numpy as np
 import xml.etree.ElementTree as ET
 from io import BytesIO
 
-# ---- НАСТРОЙКИ ----
-SEGMENT_LENGTH_SEC = 30
-MIN_SEGMENT_DURATION = 10.0
-MIN_SEGMENT_DISTANCE_M = 20.0
-MIN_SEGMENT_SPEED_KMH = 10.0
-MAX_ABS_SLOPE_PERCENT = 30.0
-MIN_ABS_DELTA_ELEV = 0.3
+# ---------------- НАСТРОЙКИ ----------------
+SEGMENT_LENGTH_SEC = 10
+MIN_SEGMENT_DURATION = 8.0           # реални секунди
+MIN_SEGMENT_DISTANCE_M = 20.0        # минимум дистанция в сегмента
+MIN_SEGMENT_SPEED_KMH = 10.0         # минимум средна скорост
+MAX_ABS_SLOPE_PERCENT = 30.0         # |slope| <= 30%
+MIN_ABS_DELTA_ELEV = 0.3             # за да не е само шум във височината
 
-MAX_SPEED_M_S = 30.0
-MAX_ALT_RATE_M_S = 5.0
+# филтри за суровите данни
+MAX_SPEED_M_S = 30.0                 # ~108 km/h
+MAX_ALT_RATE_M_S = 5.0               # макс вертикална скорост
 
-MIN_DOWNHILL_SLOPE = -7.0   # граница за downhill
+# downhill условие за самия сегмент
+MIN_DOWNHILL_SLOPE = -7.0            # среден наклон <= -7%
 
-# ---- TCX ПАРСВАНЕ ----
+# условие за предходните 10 s
+PRE_WINDOW_SEC = 10
+MIN_PRE_WINDOW_DIST_M = 10.0         # минимум дистанция в предходния прозорец
+
+# ---------------- TCX ПАРСВАНЕ ----------------
 def parse_tcx_bytes(file_bytes: bytes) -> pd.DataFrame:
     tree = ET.parse(BytesIO(file_bytes))
     root = tree.getroot()
@@ -49,13 +55,13 @@ def parse_tcx_bytes(file_bytes: bytes) -> pd.DataFrame:
     df = df.sort_values("time").reset_index(drop=True)
     return df
 
-# ---- СГЛАЖДАНЕ НА ВИСОЧИНАТА ----
+# ---------------- СГЛАЖДАНЕ НА ВИСОЧИНАТА ----------------
 def smooth_altitude(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["altitude_m"] = df["altitude_m"].rolling(3, center=True).median()
     return df
 
-# ---- ЧИСТЕНЕ НА АРТЕФАКТИ ----
+# ---------------- ЧИСТЕНЕ НА АРТЕФАКТИ ----------------
 def clean_artifacts(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["dt"] = df["time"].diff().dt.total_seconds()
@@ -69,13 +75,13 @@ def clean_artifacts(df: pd.DataFrame) -> pd.DataFrame:
     mask &= (df["dt"].isna() | (df["dt"] > 0))
     mask &= (df["ddist"].isna() | (df["ddist"] >= 0))
     mask &= (speed.isna() | ((speed >= 0) & (speed <= MAX_SPEED_M_S)))
-    mask &= (alt_rate.isna() | (abs(alt_rate) <= MAX_ALT_RATE_M_S))
+    mask &= (alt_rate.isna() | (alt_rate.abs() <= MAX_ALT_RATE_M_S))
 
     df = df[mask].copy().reset_index(drop=True)
     df = df[["time", "distance_m", "altitude_m"]]
     return df
 
-# ---- СРЕДНА СКОРОСТ НА ЦЯЛАТА АКТИВНОСТ ----
+# ---------------- СРЕДНА СКОРОСТ НА АКТИВНОСТТА ----------------
 def compute_activity_avg_speed(df: pd.DataFrame) -> float:
     if len(df) < 2:
         return np.nan
@@ -92,7 +98,7 @@ def compute_activity_avg_speed(df: pd.DataFrame) -> float:
     speed_m_s = dist / dt
     return speed_m_s * 3.6
 
-# ---- СЕГМЕНТИРАНЕ + Δv ----
+# ---------------- СЕГМЕНТИРАНЕ + Δv ----------------
 def segment_activity(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["elapsed_s"] = (df["time"] - df["time"].iloc[0]).dt.total_seconds()
@@ -134,15 +140,31 @@ def segment_activity(df: pd.DataFrame) -> pd.DataFrame:
         slope_percent = (dh / dist) * 100.0
         if abs(slope_percent) > MAX_ABS_SLOPE_PERCENT:
             continue
+        # downhill условие за самия сегмент
+        if slope_percent > MIN_DOWNHILL_SLOPE:
+            continue  # трябва да е <= -7%
 
-        # начална скорост (v_start) – от първите две точки
+        # --------- ДОПЪЛНИТЕЛЕН ФИЛТЪР: ПРЕДИШНИ 10 s ДА СА СПУСКАНЕ ---------
+        window_start = t_start - pd.Timedelta(seconds=PRE_WINDOW_SEC)
+        prev = df[(df["time"] >= window_start) & (df["time"] < t_start)]
+        if len(prev) < 2:
+            continue
+
+        prev_dist = prev["distance_m"].iloc[-1] - prev["distance_m"].iloc[0]
+        prev_dh = prev["altitude_m"].iloc[-1] - prev["altitude_m"].iloc[0]
+
+        if prev_dist <= MIN_PRE_WINDOW_DIST_M:
+            continue  # твърде малко движение, шум
+        if prev_dh >= 0:
+            continue  # не е реално спускане в предишните 10 s
+
+        # --------- НАЧАЛНА И КРАЙНА СКОРОСТ (Δv) ---------
         dt_start = (g["time"].iloc[1] - g["time"].iloc[0]).total_seconds()
         if dt_start > 0:
             v_start_m_s = (g["distance_m"].iloc[1] - g["distance_m"].iloc[0]) / dt_start
         else:
             v_start_m_s = avg_speed_m_s
 
-        # крайна скорост (v_end) – от последните две точки
         dt_end = (g["time"].iloc[-1] - g["time"].iloc[-2]).total_seconds()
         if dt_end > 0:
             v_end_m_s = (g["distance_m"].iloc[-1] - g["distance_m"].iloc[-2]) / dt_end
@@ -154,6 +176,8 @@ def segment_activity(df: pd.DataFrame) -> pd.DataFrame:
 
         rows.append({
             "segment_idx": seg_idx,
+            "t_start": t_start,
+            "t_end": t_end,
             "duration_s": duration_s,
             "segment_distance_m": dist,
             "delta_elev_m": dh,
@@ -168,11 +192,10 @@ def segment_activity(df: pd.DataFrame) -> pd.DataFrame:
     seg_df = pd.DataFrame(rows)
     return seg_df.sort_values("segment_idx").reset_index(drop=True)
 
-# ---- DOWNHILL СРЕДНИ ПОКАЗАТЕЛИ ----
+# ---------------- СРЕДНИ ПОКАЗАТЕЛИ ЗА DOWNHILL ----------------
 def downhill_summary(seg_df: pd.DataFrame) -> dict:
-    down = seg_df[seg_df["slope_percent"] <= MIN_DOWNHILL_SLOPE]
-
-    if down.empty:
+    # тук сег_df вече е само с сегменти, които са downhill и имат предишни 10 s спускане
+    if seg_df.empty:
         return {
             "n_downhill_segments": 0,
             "avg_slope_percent": np.nan,
@@ -181,13 +204,13 @@ def downhill_summary(seg_df: pd.DataFrame) -> dict:
         }
 
     return {
-        "n_downhill_segments": len(down),
-        "avg_slope_percent": down["slope_percent"].mean(),
-        "avg_downhill_speed_kmh": down["avg_speed_kmh"].mean(),
-        "avg_dv_kmh": down["dv_kmh"].mean(),
+        "n_downhill_segments": len(seg_df),
+        "avg_slope_percent": seg_df["slope_percent"].mean(),
+        "avg_downhill_speed_kmh": seg_df["avg_speed_kmh"].mean(),
+        "avg_dv_kmh": seg_df["dv_kmh"].mean(),
     }
 
-# ---- ОБРАБОТКА НА ЕДНА АКТИВНОСТ ----
+# ---------------- ОБРАБОТКА НА ЕДНА АКТИВНОСТ ----------------
 def process_activity(file) -> dict:
     file_bytes = file.read()
     df_raw = parse_tcx_bytes(file_bytes)
@@ -206,22 +229,30 @@ def process_activity(file) -> dict:
         "avg_dv_kmh": downhill["avg_dv_kmh"],
         "avg_activity_speed_kmh": avg_activity_speed_kmh,
     }
-    return result
+    return result, seg_df
 
-# ---- STREAMLIT UI ----
+# ---------------- STREAMLIT UI ----------------
 def main():
-    st.title("Ski-Glide-Dynamics — Многократни активности (Δv модел)")
+    st.title("Ski-Glide-Dynamics — 10 s сегменти + предишни 10 s спускане (Δv модел)")
 
-    files = st.file_uploader("Качи един или повече TCX файла", type=["tcx"], accept_multiple_files=True)
+    files = st.file_uploader(
+        "Качи един или повече TCX файла",
+        type=["tcx"],
+        accept_multiple_files=True
+    )
+
     if not files:
         st.info("Качи поне един TCX файл, за да започнем.")
         return
 
     results = []
+    debug_segments = {}
+
     for f in files:
         try:
-            res = process_activity(f)
+            res, seg_df = process_activity(f)
             results.append(res)
+            debug_segments[f.name] = seg_df
         except Exception as e:
             st.error(f"Грешка при обработка на {f.name}: {e}")
 
@@ -231,17 +262,30 @@ def main():
 
     df_results = pd.DataFrame(results)
 
-    st.subheader("Сравнение на активности (4-те ключови показателя)")
+    st.subheader("Сравнение на активности (4 ключови показателя)")
     st.dataframe(df_results)
 
     st.write("""
     **Колони:**
-    - `avg_slope_percent` – среден наклон (%) на downhill сегментите (slope ≤ -7%).
+    - `avg_slope_percent` – среден наклон (%) на сегментите, които:
+      - са по 10 s,
+      - имат среден наклон ≤ -7%,
+      - имат ≥ 20 m дистанция и ≥ 10 km/h,
+      - и предходните 10 s преди тях също са със слизане (отрицателна денивелация).
     - `avg_downhill_speed_kmh` – средна скорост (km/h) в тези сегменти.
     - `avg_dv_kmh` – средна разлика в скоростта между начало и край на сегмента (Δv).
     - `avg_activity_speed_kmh` – средна скорост на цялата активност.
-    - `n_downhill_segments` – брой downhill сегменти, върху които са изчислени показателите.
+    - `n_downhill_segments` – брой валидни downhill сегменти.
     """)
+
+    # по избор: да разгледаш сегментите за конкретна активност
+    selected_name = st.selectbox(
+        "Избери активност за да видиш сегментите (по желание):",
+        options=list(debug_segments.keys())
+    )
+    if selected_name:
+        st.write(f"Сегменти за: **{selected_name}**")
+        st.dataframe(debug_segments[selected_name].head(50))
 
 if __name__ == "__main__":
     main()
