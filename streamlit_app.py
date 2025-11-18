@@ -5,11 +5,11 @@ import xml.etree.ElementTree as ET
 from io import BytesIO
 
 # ---------------- НАСТРОЙКИ ----------------
-SEGMENT_LENGTH_SEC = 15
+SEGMENT_LENGTH_SEC = 10
 MIN_SEGMENT_DURATION = 8.0           # реални секунди
-MIN_SEGMENT_DISTANCE_M = 30.0        # минимум дистанция в сегмента
-MIN_SEGMENT_SPEED_KMH = 15.0         # минимум средна скорост
-MAX_ABS_SLOPE_PERCENT = 23.0         # |slope| <= 30%
+MIN_SEGMENT_DISTANCE_M = 20.0        # минимум дистанция в сегмента
+MIN_SEGMENT_SPEED_KMH = 10.0         # минимум средна скорост
+MAX_ABS_SLOPE_PERCENT = 30.0         # |slope| <= 30%
 MIN_ABS_DELTA_ELEV = 0.3             # за да не е само шум във височината
 
 # филтри за суровите данни
@@ -22,6 +22,10 @@ MIN_DOWNHILL_SLOPE = -7.0            # среден наклон <= -7%
 # условие за предходните 10 s
 PRE_WINDOW_SEC = 10
 MIN_PRE_WINDOW_DIST_M = 10.0         # минимум дистанция в предходния прозорец
+MIN_PRE_WINDOW_SLOPE = -5.0          # среден наклон в предишните 10 s <= -5%
+
+# за "само отрицателна денивелация" в сегмента:
+MAX_LOCAL_UPHILL_M = 0.1             # позволен малък локален шум (+0.1 m)
 
 # ---------------- TCX ПАРСВАНЕ ----------------
 def parse_tcx_bytes(file_bytes: bytes) -> pd.DataFrame:
@@ -141,10 +145,11 @@ def segment_activity(df: pd.DataFrame) -> pd.DataFrame:
         if abs(slope_percent) > MAX_ABS_SLOPE_PERCENT:
             continue
         # downhill условие за самия сегмент
-        if slope_percent > MIN_DOWNHILL_SLOPE:
-            continue  # трябва да е <= -7%
+        if slope_percent > MIN_DOWNHILL_SLOPE:  # трябва да е <= -7%
+            continue
 
-        # --------- ДОПЪЛНИТЕЛЕН ФИЛТЪР: ПРЕДИШНИ 10 s ДА СА СПУСКАНЕ ---------
+        # --------- ДОПЪЛНИТЕЛЕН ФИЛТЪР 1:
+        # ПРЕДИШНИТЕ 10 s ДА СА СПУСКАНЕ СЪС SLOPE <= -5% ---------
         window_start = t_start - pd.Timedelta(seconds=PRE_WINDOW_SEC)
         prev = df[(df["time"] >= window_start) & (df["time"] < t_start)]
         if len(prev) < 2:
@@ -155,8 +160,17 @@ def segment_activity(df: pd.DataFrame) -> pd.DataFrame:
 
         if prev_dist <= MIN_PRE_WINDOW_DIST_M:
             continue  # твърде малко движение, шум
-        if prev_dh >= 0:
-            continue  # не е реално спускане в предишните 10 s
+
+        prev_slope = (prev_dh / prev_dist) * 100.0
+        if prev_slope > MIN_PRE_WINDOW_SLOPE:  # напр. > -5%
+            continue  # не е достатъчно ясно спускане преди сегмента
+
+        # --------- ДОПЪЛНИТЕЛЕН ФИЛТЪР 2:
+        # ЦЕЛИЯТ СЕГМЕНТ ДА Е САМО С ОТРИЦАТЕЛНА ДЕНИВЕЛАЦИЯ ---------
+        alt_diff = g["altitude_m"].diff().dropna()
+        # ако има локални изкачвания > MAX_LOCAL_UPHILL_M, отхвърляме сегмента
+        if (alt_diff > MAX_LOCAL_UPHILL_M).any():
+            continue
 
         # --------- НАЧАЛНА И КРАЙНА СКОРОСТ (Δv) ---------
         dt_start = (g["time"].iloc[1] - g["time"].iloc[0]).total_seconds()
@@ -194,7 +208,11 @@ def segment_activity(df: pd.DataFrame) -> pd.DataFrame:
 
 # ---------------- СРЕДНИ ПОКАЗАТЕЛИ ЗА DOWNHILL ----------------
 def downhill_summary(seg_df: pd.DataFrame) -> dict:
-    # тук сег_df вече е само с сегменти, които са downhill и имат предишни 10 s спускане
+    # тук seg_df вече е само с сегменти, които са:
+    # - 10 s
+    # - наклон <= -7%
+    # - имат предишни 10 s със slope <= -5%
+    # - и са само с отрицателна денивелация вътре в сегмента
     if seg_df.empty:
         return {
             "n_downhill_segments": 0,
@@ -211,7 +229,7 @@ def downhill_summary(seg_df: pd.DataFrame) -> dict:
     }
 
 # ---------------- ОБРАБОТКА НА ЕДНА АКТИВНОСТ ----------------
-def process_activity(file) -> dict:
+def process_activity(file) -> tuple[dict, pd.DataFrame]:
     file_bytes = file.read()
     df_raw = parse_tcx_bytes(file_bytes)
     df_smooth = smooth_altitude(df_raw)
@@ -233,7 +251,7 @@ def process_activity(file) -> dict:
 
 # ---------------- STREAMLIT UI ----------------
 def main():
-    st.title("Ski-Glide-Dynamics — 10 s сегменти + предишни 10 s спускане (Δv модел)")
+    st.title("Ski-Glide-Dynamics — чисти 10 s спускания (Δv модел)")
 
     files = st.file_uploader(
         "Качи един или повече TCX файла",
@@ -271,14 +289,14 @@ def main():
       - са по 10 s,
       - имат среден наклон ≤ -7%,
       - имат ≥ 20 m дистанция и ≥ 10 km/h,
-      - и предходните 10 s преди тях също са със слизане (отрицателна денивелация).
+      - предишните 10 s преди тях имат среден наклон ≤ -5% (ясно изразено спускане),
+      - и целият сегмент е с отрицателна денивелация (без локални изкачвания).
     - `avg_downhill_speed_kmh` – средна скорост (km/h) в тези сегменти.
     - `avg_dv_kmh` – средна разлика в скоростта между начало и край на сегмента (Δv).
     - `avg_activity_speed_kmh` – средна скорост на цялата активност.
     - `n_downhill_segments` – брой валидни downhill сегменти.
     """)
 
-    # по избор: да разгледаш сегментите за конкретна активност
     selected_name = st.selectbox(
         "Избери активност за да видиш сегментите (по желание):",
         options=list(debug_segments.keys())
