@@ -1,279 +1,307 @@
-import io
-import xml.etree.ElementTree as ET
-
-import numpy as np
-import pandas as pd
 import streamlit as st
-from statsmodels.nonparametric.smoothers_lowess import lowess
+import pandas as pd
+import numpy as np
+import xml.etree.ElementTree as ET
+from io import BytesIO
 
-st.set_page_config(page_title="onFlows — Mechanical Power (from TCX)", layout="wide")
+# ---- НАСТРОЙКИ ----
+SEGMENT_LENGTH_SEC = 10          # дължина на сегмента в секунди
+MIN_DOWNHILL_SLOPE = -5.0        # % наклон, под който броим сегмента (напр. -5% = поне 5% спускане)
+MIN_SEGMENT_DURATION = 8.0       # минимални реални секунди в сегмента, за да го считаме за "стабилен"
+MAX_SPEED_M_S = 30.0             # груб филтър за артефакти (~108 km/h)
+MAX_ALT_RATE_M_S = 50.0          # филтър за ненормални скокове във височината
 
 
-# ---------- TCX parser ----------
-
-def parse_tcx_bytes(data: bytes) -> pd.DataFrame:
+# ---- ПАРСВАНЕ НА TCX ----
+def parse_tcx(file) -> pd.DataFrame:
     """
-    Парсва TCX от bytes → DataFrame с time, distance_m, altitude_m, speed (m/s).
+    Чете TCX файл и връща DataFrame с колони:
+    time (datetime64), distance_m (float), altitude_m (float)
     """
-    tree = ET.parse(io.BytesIO(data))
+    # за да може ET.parse да работи повече от веднъж, правим копие
+    file_bytes = file.read()
+    tree = ET.parse(BytesIO(file_bytes))
     root = tree.getroot()
 
-    ns = {"tcx": "http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2"}
-
-    times, dist, alt = [], [], []
-
-    for tp in root.findall(".//tcx:Trackpoint", ns):
-        t_el = tp.find("tcx:Time", ns)
-        d_el = tp.find("tcx:DistanceMeters", ns)
-        a_el = tp.find("tcx:AltitudeMeters", ns)
-
-        if t_el is None or d_el is None or a_el is None:
+    # Събираме всички Trackpoint елементи, без да се занимаваме с namespace
+    trackpoints = []
+    for tp in root.iter():
+        if not tp.tag.endswith("Trackpoint"):
             continue
 
-        times.append(t_el.text)
-        dist.append(float(d_el.text))
-        alt.append(float(a_el.text))
+        time_el = None
+        dist_el = None
+        alt_el = None
 
-    df = pd.DataFrame(
-        {
-            "time": pd.to_datetime(times),
-            "distance_m": dist,
-            "altitude_m": alt,
-        }
-    )
+        for child in tp:
+            if child.tag.endswith("Time"):
+                time_el = child
+            elif child.tag.endswith("DistanceMeters"):
+                dist_el = child
+            elif child.tag.endswith("AltitudeMeters"):
+                alt_el = child
 
-    df["t_sec"] = (df["time"] - df["time"].iloc[0]).dt.total_seconds()
+        if time_el is None:
+            continue  # без време няма как да използваме точката
 
-    dt = df["t_sec"].diff().replace(0, np.nan)
-    df["speed"] = df["distance_m"].diff().divide(dt).fillna(0.0)  # m/s
+        time = pd.to_datetime(time_el.text)
 
-    return df
+        distance_m = float(dist_el.text) if dist_el is not None else np.nan
+        altitude_m = float(alt_el.text) if alt_el is not None else np.nan
 
-
-# ---------- helpers ----------
-
-def central_diff(y, x):
-    dy = np.zeros_like(y)
-    dx = np.zeros_like(y)
-
-    dy[1:-1] = y[2:] - y[:-2]
-    dx[1:-1] = x[2:] - x[:-2]
-
-    dy[0] = y[1] - y[0]
-    dx[0] = x[1] - x[0]
-    dy[-1] = y[-1] - y[-2]
-    dx[-1] = x[-1] - x[-2]
-
-    dx[dx == 0] = np.nan
-    return dy / dx
-
-
-def smooth_and_kin(df: pd.DataFrame, frac: float = 0.02) -> pd.DataFrame:
-    """
-    LOWESS изглаждане на височина, дистанция, скорост + наклон (%) и ускорение.
-    """
-    t = df["t_sec"].values
-
-    df["alt_smooth"] = lowess(df["altitude_m"], t, frac=frac, return_sorted=False)
-    df["dist_smooth"] = lowess(df["distance_m"], t, frac=frac, return_sorted=False)
-    df["speed_smooth"] = lowess(df["speed"], t, frac=frac, return_sorted=False)
-
-    dalt_dt = central_diff(df["alt_smooth"].values, t)
-    ddist_dt = central_diff(df["dist_smooth"].values, t)
-    dspeed_dt = central_diff(df["speed_smooth"].values, t)
-
-    # наклон (%)
-    raw_grade = (dalt_dt / ddist_dt) * 100.0
-    df["grade"] = lowess(raw_grade, t, frac=0.05, return_sorted=False)
-
-    # ускорение (m/s^2)
-    df["acc"] = lowess(dspeed_dt, t, frac=0.05, return_sorted=False)
-
-    return df
-
-
-def compute_mechanical_power(df: pd.DataFrame, mass_kg: float) -> pd.DataFrame:
-    """
-    P_grav = m g v grade/100 (само ако grade>0)
-    P_kin  = m a v (само ако a>0)
-    P_mech = P_grav_pos + P_kin_pos
-    """
-    g = 9.80665
-
-    v = df["speed_smooth"].values      # m/s
-    grade_frac = df["grade"].values / 100.0
-    a = df["acc"].values
-
-    # мощност срещу гравитацията
-    P_grav = mass_kg * g * v * grade_frac
-    P_grav_pos = np.maximum(P_grav, 0.0)
-
-    # мощност за ускоряване
-    a_pos = np.maximum(a, 0.0)
-    P_kin = mass_kg * a_pos * v
-
-    P_mech = P_grav_pos + P_kin
-
-    df["P_grav_W"] = P_grav_pos
-    df["P_kin_W"] = P_kin
-    df["P_mech_W"] = P_mech
-    df["P_mech_Wkg"] = df["P_mech_W"] / mass_kg
-
-    return df
-
-
-def time_weighted_mean(series: pd.Series, t_sec: pd.Series) -> float:
-    """
-    Времево претеглена средна мощност.
-    """
-    if len(series) < 2:
-        return np.nan
-
-    t = t_sec.values
-    dt = np.diff(t)
-    dt = np.append(dt, dt[-1])
-
-    x = series.values
-    w = dt
-
-    mask = np.isfinite(x) & np.isfinite(w)
-    if mask.sum() == 0:
-        return np.nan
-
-    return float(np.sum(x[mask] * w[mask]) / np.sum(w[mask]))
-
-
-# ---------- Streamlit UI ----------
-
-def main():
-    st.title("onFlows — Механична мощност от TCX (гравитация + ускорение)")
-
-    st.markdown(
-        """
-Това приложение изчислява **минималната положителна механична мощност** на спортиста
-според профила на скоростта и наклона:
-
-- **P_grav** – мощност за преодоляване на изкачванията  
-- **P_kin** – мощност за ускорения  
-- **P_mech = P_grav + P_kin** (само положителната част)  
-
-Не включва триене и въздушно съпротивление, така че стойностите са по-скоро
-*минимална необходима механична мощност*, но са полезни за сравнение между активности.
-"""
-    )
-
-    uploaded_files = st.file_uploader(
-        "Качи един или няколко TCX файла",
-        type=["tcx"],
-        accept_multiple_files=True,
-    )
-
-    if not uploaded_files:
-        st.info("Качи поне един TCX файл.")
-        return
-
-    st.sidebar.header("Параметри на модела")
-
-    mass_kg = st.sidebar.number_input(
-        "Тегло на спортиста (kg)",
-        min_value=40.0,
-        max_value=120.0,
-        value=70.0,
-        step=1.0,
-    )
-
-    smooth_frac = st.sidebar.slider(
-        "Степен на изглаждане (LOWESS frac)",
-        min_value=0.01,
-        max_value=0.20,
-        value=0.02,
-        step=0.01,
-    )
-
-    results = {}
-
-    for file in uploaded_files:
-        try:
-            data = file.read()
-            df_raw = parse_tcx_bytes(data)
-            df = smooth_and_kin(df_raw, frac=smooth_frac)
-            df = compute_mechanical_power(df, mass_kg)
-
-            # времево претеглени средни стойности
-            mean_P = time_weighted_mean(df["P_mech_W"], df["t_sec"])
-            mean_Pkg = time_weighted_mean(df["P_mech_Wkg"], df["t_sec"])
-            mean_Pgrav = time_weighted_mean(df["P_grav_W"], df["t_sec"])
-            mean_Pkin = time_weighted_mean(df["P_kin_W"], df["t_sec"])
-
-            results[file.name] = {
-                "df": df,
-                "mean_P": mean_P,
-                "mean_Pkg": mean_Pkg,
-                "mean_Pgrav": mean_Pgrav,
-                "mean_Pkin": mean_Pkin,
+        trackpoints.append(
+            {
+                "time": time,
+                "distance_m": distance_m,
+                "altitude_m": altitude_m,
             }
+        )
 
-        except Exception as e:
-            st.error(f"Грешка при обработка на {file.name}: {e}")
+    if not trackpoints:
+        raise ValueError("Не бяха намерени Trackpoint данни в TCX файла.")
 
-    # Резюме таблица
+    df = pd.DataFrame(trackpoints).dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
+
+    # Нормализираме, ако има липсващи разстояния или височини
+    # (тук просто оставяме NaN – по-нататък ще ги игнорираме при slope)
+    return df
+
+
+# ---- ЧИСТЕНЕ НА АРТЕФАКТИ ----
+def clean_artifacts(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Премахва очевидно невалидни точки:
+    - отрицателен или нулев времеви интервал
+    - отрицателна промяна в дистанцията
+    - нереалистично висока скорост
+    - нереалистичен вертикален темп (скок във височината)
+    """
+    df = df.copy()
+    df["time"] = pd.to_datetime(df["time"])
+    df = df.sort_values("time").reset_index(drop=True)
+
+    df["dt"] = df["time"].diff().dt.total_seconds()
+    df["ddist"] = df["distance_m"].diff()
+    df["dalt"] = df["altitude_m"].diff()
+
+    # Базови филтри
+    # първият ред ще е с NaN, ще го запазим отделно
+    mask_valid = True
+
+    # dt трябва да е положително
+    mask_valid = mask_valid & ((df["dt"].isna()) | (df["dt"] > 0))
+
+    # не допускаме назад във времето или нулево dt (освен първия ред)
+    # ddist >= 0 (не допускаме да "намалява" дистанцията)
+    mask_valid = mask_valid & ((df["ddist"].isna()) | (df["ddist"] >= 0))
+
+    # скорост = ddist / dt
+    speed_m_s = df["ddist"] / df["dt"]
+    # нереалистично високи скорости и отрицателни скорости
+    mask_valid = mask_valid & ((speed_m_s.isna()) | ((speed_m_s >= 0) & (speed_m_s <= MAX_SPEED_M_S)))
+
+    # скорост на промяна на височината
+    alt_rate_m_s = df["dalt"] / df["dt"]
+    mask_valid = mask_valid & (
+        (alt_rate_m_s.isna()) | (alt_rate_m_s.abs() <= MAX_ALT_RATE_M_S)
+    )
+
+    # Пазим само валидните точки
+    df_clean = df[mask_valid].copy().reset_index(drop=True)
+
+    # Премахваме помощните колони
+    df_clean = df_clean[["time", "distance_m", "altitude_m"]]
+
+    return df_clean
+
+
+# ---- СЕГМЕНТИРАНЕ В 10-СЕК ИНТЕРВАЛИ ----
+def segment_activity(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Сегментира цялата активност на 10-секундни интервали.
+    За всеки сегмент изчислява:
+      - duration_s
+      - segment_distance_m
+      - delta_elev_m
+      - avg_speed_kmh
+      - slope_percent
+    """
+    df = df.copy()
+    df["time"] = pd.to_datetime(df["time"])
+    df = df.sort_values("time").reset_index(drop=True)
+
+    start_time = df["time"].min()
+    df["elapsed_s"] = (df["time"] - start_time).dt.total_seconds()
+
+    # Индекс на сегмента: 0,1,2... на всеки 10 секунди
+    df["segment_idx"] = (df["elapsed_s"] // SEGMENT_LENGTH_SEC).astype(int)
+
+    # Групираме по сегмент
+    grouped = df.groupby("segment_idx")
+
     rows = []
-    for name, obj in results.items():
+    for seg_idx, g in grouped:
+        if len(g) < 2:
+            continue
+
+        t_start = g["time"].iloc[0]
+        t_end = g["time"].iloc[-1]
+        duration_s = (t_end - t_start).total_seconds()
+
+        dist_start = g["distance_m"].iloc[0]
+        dist_end = g["distance_m"].iloc[-1]
+        segment_distance_m = dist_end - dist_start
+
+        alt_start = g["altitude_m"].iloc[0]
+        alt_end = g["altitude_m"].iloc[-1]
+        delta_elev_m = alt_end - alt_start
+
+        # филтри за стабилност
+        if duration_s < MIN_SEGMENT_DURATION:
+            continue
+        if segment_distance_m <= 0:
+            continue
+        if pd.isna(alt_start) or pd.isna(alt_end):
+            continue
+
+        avg_speed_m_s = segment_distance_m / duration_s
+        avg_speed_kmh = avg_speed_m_s * 3.6
+
+        slope_percent = (delta_elev_m / segment_distance_m) * 100.0
+
         rows.append(
             {
-                "activity": name,
-                "mean_P_W": obj["mean_P"],
-                "mean_P_Wkg": obj["mean_Pkg"],
-                "mean_P_grav_W": obj["mean_Pgrav"],
-                "mean_P_kin_W": obj["mean_Pkin"],
+                "segment_idx": seg_idx,
+                "t_start": t_start,
+                "t_end": t_end,
+                "duration_s": duration_s,
+                "segment_distance_m": segment_distance_m,
+                "delta_elev_m": delta_elev_m,
+                "avg_speed_kmh": avg_speed_kmh,
+                "slope_percent": slope_percent,
             }
         )
 
-    res_df = pd.DataFrame(rows)
+    seg_df = pd.DataFrame(rows)
+    if seg_df.empty:
+        return seg_df
 
-    st.subheader("Резюме по активности (механична мощност)")
-    st.dataframe(
-        res_df.style.format(
-            {
-                "mean_P_W": "{:.1f}",
-                "mean_P_Wkg": "{:.2f}",
-                "mean_P_grav_W": "{:.1f}",
-                "mean_P_kin_W": "{:.1f}",
-            }
-        )
+    seg_df = seg_df.sort_values("segment_idx").reset_index(drop=True)
+    return seg_df
+
+
+# ---- ФИЛТЪР ЗА СПУСКАНИЯ И АГРЕГАЦИЯ ----
+def compute_downhill_sums(seg_df: pd.DataFrame):
+    """
+    Взима само сегментите със наклон < MIN_DOWNHILL_SLOPE
+    и връща:
+      - sum_speed_kmh
+      - sum_slope_percent
+      - avg_speed_kmh
+      - avg_slope_percent
+      - count_segments
+    """
+    downhill = seg_df[seg_df["slope_percent"] <= MIN_DOWNHILL_SLOPE].copy()
+
+    if downhill.empty:
+        return {
+            "count_segments": 0,
+            "sum_speed_kmh": 0.0,
+            "sum_slope_percent": 0.0,
+            "avg_speed_kmh": 0.0,
+            "avg_slope_percent": 0.0,
+            "downhill_df": downhill,
+        }
+
+    sum_speed_kmh = downhill["avg_speed_kmh"].sum()
+    sum_slope_percent = downhill["slope_percent"].sum()
+
+    avg_speed_kmh = downhill["avg_speed_kmh"].mean()
+    avg_slope_percent = downhill["slope_percent"].mean()
+
+    return {
+        "count_segments": len(downhill),
+        "sum_speed_kmh": sum_speed_kmh,
+        "sum_slope_percent": sum_slope_percent,
+        "avg_speed_kmh": avg_speed_kmh,
+        "avg_slope_percent": avg_slope_percent,
+        "downhill_df": downhill,
+    }
+
+
+# ---- STREAMLIT UI ----
+def main():
+    st.title("Ski-Glide-Dynamics — 10 сек сегменти по наклон")
+
+    st.write(
+        """
+        **Описание на модела:**
+
+        1. Зареждаме TCX файл и премахваме артефакти (обратна дистанция, нереалистични скорости и скокове във височината).
+        2. Сегментираме цялата активност на **10-секундни интервали**.
+        3. За всеки сегмент изчисляваме:
+           - средна скорост (km/h),
+           - промяна във височината (м) от началото до края на сегмента,
+           - изминат път в сегмента (м),
+           - реален наклон в %.
+        4. Вземаме **само сегментите**, където наклонът е под **-5%**.
+        5. Накрая извеждаме:
+           - сумата от скоростите в тези сегменти,
+           - сумата от наклоните в % в тези сегменти.
+        """
     )
 
-    # Детайлна визуализация
-    selected = st.selectbox(
-        "Избери активност за детайлна графика",
-        res_df["activity"].tolist(),
-    )
+    uploaded_file = st.file_uploader("Качи TCX файл", type=["tcx"])
 
-    df_sel = results[selected]["df"]
+    if uploaded_file is not None:
+        try:
+            df_raw = parse_tcx(uploaded_file)
+        except Exception as e:
+            st.error(f"Грешка при парсване на TCX файла: {e}")
+            return
 
-    st.subheader(f"Графики — {selected}")
+        st.success(f"Успешно зареден TCX с {len(df_raw)} точки.")
+        if st.checkbox("Покажи суровите данни (първите 10 реда)"):
+            st.dataframe(df_raw.head(10))
 
-    with st.expander("Скорост, наклон и ускорение"):
-        st.line_chart(
-            df_sel.set_index("t_sec")[["speed_smooth"]].rename(
-                columns={"speed_smooth": "speed (m/s)"}
-            )
-        )
-        st.line_chart(
-            df_sel.set_index("t_sec")[["grade"]].rename(columns={"grade": "grade (%)"})
-        )
-        st.line_chart(
-            df_sel.set_index("t_sec")[["acc"]].rename(columns={"acc": "acc (m/s²)"})
-        )
+        # Чистене на артефакти
+        df_clean = clean_artifacts(df_raw)
+        st.write(f"След почистване останаха **{len(df_clean)}** точки.")
 
-    st.markdown("**Механична мощност във времето (W и W/kg):**")
-    power_plot = df_sel.set_index("t_sec")[["P_mech_W", "P_mech_Wkg"]]
-    st.line_chart(power_plot)
+        # Сегментиране
+        seg_df = segment_activity(df_clean)
+        if seg_df.empty:
+            st.error("Не бяха създадени валидни сегменти. Проверете данните.")
+            return
 
-    st.caption(
-        "Важно: това е минимална външна механична мощност (само гравитация + ускорения). "
-        "Реалната метаболитна мощност е по-висока заради триене, въздух и енергийни загуби."
-    )
+        st.write(f"Общ брой сегменти (след филтри за стабилност): **{len(seg_df)}**")
+
+        if st.checkbox("Покажи всички сегменти (първите 20):"):
+            st.dataframe(seg_df.head(20))
+
+        # Изчисление на сумите за спускане
+        results = compute_downhill_sums(seg_df)
+
+        st.subheader("Резултати за сегментите с наклон < -5%")
+
+        st.write(f"Брой спускащи сегменти: **{results['count_segments']}**")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Сума от скоростите (km/h)", f"{results['sum_speed_kmh']:.2f}")
+            st.metric("Средна скорост (km/h)", f"{results['avg_speed_kmh']:.2f}")
+        with col2:
+            st.metric("Сума от наклоните (%)", f"{results['sum_slope_percent']:.2f}")
+            st.metric("Среден наклон (%)", f"{results['avg_slope_percent']:.2f}")
+
+        if results["count_segments"] == 0:
+            st.warning("Няма сегменти с наклон под -5%.")
+        else:
+            if st.checkbox("Покажи детайлите за downhill сегментите (първите 20):"):
+                st.dataframe(results["downhill_df"].head(20))
+
+    else:
+        st.info("Моля, качи TCX файл, за да започнем анализа.")
 
 
 if __name__ == "__main__":
