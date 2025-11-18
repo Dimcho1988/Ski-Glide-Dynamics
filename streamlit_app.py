@@ -5,11 +5,11 @@ import xml.etree.ElementTree as ET
 from io import BytesIO
 
 # ---------------- НАСТРОЙКИ ----------------
-SEGMENT_LENGTH_SEC = 10
+SEGMENT_LENGTH_SEC = 15
 MIN_SEGMENT_DURATION = 8.0           # реални секунди
-MIN_SEGMENT_DISTANCE_M = 20.0        # минимум дистанция в сегмента
-MIN_SEGMENT_SPEED_KMH = 10.0         # минимум средна скорост
-MAX_ABS_SLOPE_PERCENT = 30.0         # |slope| <= 30%
+MIN_SEGMENT_DISTANCE_M = 30.0        # минимум дистанция в сегмента
+MIN_SEGMENT_SPEED_KMH = 15.0         # минимум средна скорост
+MAX_ABS_SLOPE_PERCENT = 23.0         # |slope| <= 30%
 MIN_ABS_DELTA_ELEV = 0.3             # за да не е само шум във височината
 
 # филтри за суровите данни
