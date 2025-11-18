@@ -5,7 +5,7 @@ import xml.etree.ElementTree as ET
 from io import BytesIO
 
 # ---- НАСТРОЙКИ ----
-SEGMENT_LENGTH_SEC = 15
+SEGMENT_LENGTH_SEC = 30
 MIN_SEGMENT_DURATION = 10.0
 MIN_SEGMENT_DISTANCE_M = 20.0
 MIN_SEGMENT_SPEED_KMH = 10.0
