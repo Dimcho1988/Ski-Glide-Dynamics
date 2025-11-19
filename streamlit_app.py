@@ -1,275 +1,436 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
+import io
 import xml.etree.ElementTree as ET
-from io import BytesIO
+from typing import List, Dict
 
-# ======================================================
-# НАСТРОЙКИ
-# ======================================================
-SEGMENT_LENGTH_SEC = 10
-MIN_SEGMENT_DURATION = 8.0
-MIN_SEGMENT_DISTANCE_M = 20.0
-MIN_SEGMENT_SPEED_KMH = 10.0
-MAX_ABS_SLOPE_PERCENT = 30.0
-MIN_ABS_DELTA_ELEV = 0.3
-
-MAX_SPEED_M_S = 30.0
-MAX_ALT_RATE_M_S = 5.0
-
-# Условия за downhill сегмент
-MIN_DOWNHILL_SLOPE = -7.0
-
-# Условия за 10-те секунди преди сегмента
-PRE_WINDOW_SEC = 10
-MIN_PRE_WINDOW_DIST_M = 10.0
-MIN_PRE_WINDOW_SLOPE = -5.0
-
-# Само отрицателна денивелация в сегмента
-MAX_LOCAL_UPHILL_M = 0.1
+import numpy as np
+import pandas as pd
+import streamlit as st
 
 
-# ======================================================
-# TCX ПАРСВАНЕ
-# ======================================================
-def parse_tcx_bytes(file_bytes):
-    tree = ET.parse(BytesIO(file_bytes))
+# ---------- 1) ПАРСВАНЕ НА TCX В DATAFRAME ----------
+
+def parse_tcx_to_df(file) -> pd.DataFrame:
+    """
+    Чете TCX файл и връща DataFrame с:
+    time (datetime), latitude, longitude, altitude (m), distance (m).
+    """
+    content = file.read()
+    # Ако е BytesIO, връщаме в началото за всеки случай
+    if isinstance(content, bytes):
+        tree = ET.parse(io.BytesIO(content))
+    else:
+        tree = ET.parse(file)
+
     root = tree.getroot()
 
-    points = []
-    for tp in root.iter():
-        if not tp.tag.endswith("Trackpoint"):
+    # { * } означава "който и да е namespace"
+    trackpoints = root.findall('.//{*}Trackpoint')
+
+    records = []
+    for tp in trackpoints:
+        time_el = tp.find('.//{*}Time')
+        alt_el = tp.find('.//{*}AltitudeMeters')
+        dist_el = tp.find('.//{*}DistanceMeters')
+        lat_el = tp.find('.//{*}Position/{*}LatitudeDegrees')
+        lon_el = tp.find('.//{*}Position/{*}LongitudeDegrees')
+
+        if time_el is None or dist_el is None or alt_el is None:
+            # Без време, дистанция или височина няма да ни свърши работа
             continue
 
-        time_el = dist_el = alt_el = None
-        for ch in tp:
-            if ch.tag.endswith("Time"):
-                time_el = ch
-            elif ch.tag.endswith("DistanceMeters"):
-                dist_el = ch
-            elif ch.tag.endswith("AltitudeMeters"):
-                alt_el = ch
-
-        if time_el is None:
+        try:
+            t = pd.to_datetime(time_el.text)
+        except Exception:
             continue
 
-        points.append({
-            "time": pd.to_datetime(time_el.text),
-            "distance_m": float(dist_el.text) if dist_el is not None else np.nan,
-            "altitude_m": float(alt_el.text) if alt_el is not None else np.nan
-        })
+        try:
+            altitude = float(alt_el.text)
+        except Exception:
+            altitude = np.nan
 
-    df = pd.DataFrame(points).dropna(subset=["time"])
-    return df.sort_values("time").reset_index(drop=True)
+        try:
+            distance = float(dist_el.text)
+        except Exception:
+            distance = np.nan
 
+        lat = float(lat_el.text) if lat_el is not None else np.nan
+        lon = float(lon_el.text) if lon_el is not None else np.nan
 
-# ======================================================
-# СГЛАЖДАНЕ НА ВИСОЧИНАТА
-# ======================================================
-def smooth_altitude(df):
-    df = df.copy()
-    df["altitude_m"] = df["altitude_m"].rolling(3, center=True).median()
+        records.append(
+            {
+                "time": t,
+                "latitude": lat,
+                "longitude": lon,
+                "altitude": altitude,
+                "distance": distance,
+            }
+        )
+
+    if not records:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records)
+    df = df.sort_values("time").drop_duplicates(subset=["time"])
+    df = df.set_index("time")
+
+    # Ресемплираме на 1 Hz, като ползваме "nearest" и после интерполация за altitude/distance
+    df = df.resample("1S").nearest(limit=1)
+
+    # Интерпулация на altitude и distance по време
+    df["altitude"] = df["altitude"].interpolate(method="time")
+    df["distance"] = df["distance"].interpolate(method="time")
+
+    df = df.reset_index()
     return df
 
 
-# ======================================================
-# ЧИСТЕНЕ НА АРТЕФАКТИ
-# ======================================================
-def clean_artifacts(df):
+# ---------- 2) ФУНКЦИЯ ЗА ФИЛТРИРАНЕ И ИЗВЛИЧАНЕ НА GLIDE-СЕГМЕНТИ ----------
+
+def extract_glide_segments(
+    df: pd.DataFrame,
+    segment_length_s: int = 10,
+    min_slope_pct: float = -5.0,
+    prev_min_slope_pct: float = -5.0,
+    min_dh_P: float = 1.5,
+    min_dh_S: float = 2.0,
+    min_dist_P: float = 20.0,
+    min_dist_S: float = 30.0,
+    min_speed_S_kmh: float = 10.0,
+    max_cv_v_S: float = 0.15,
+    eps_h: float = 0.1,
+    max_slope_diff_pct_points: float = 5.0,
+    v_max_kmh: float = 70.0,
+    alt_grad_thresh: float = 5.0,
+) -> pd.DataFrame:
+    """
+    Приема DataFrame с колони: time, altitude, distance.
+    Връща DataFrame с намерените валидни 10-сек glide-сегменти:
+    колони: start_time, end_time, mean_speed_kmh, mean_slope (в %).
+    """
+
+    if df.empty or len(df) < 2 * segment_length_s + 1:
+        return pd.DataFrame()
+
+    # 1) Почистване на очевидни артефакти и изглаждане на височината
     df = df.copy()
-    df["dt"] = df["time"].diff().dt.total_seconds()
-    df["ddist"] = df["distance_m"].diff()
-    df["dalt"] = df["altitude_m"].diff()
+    df["dt"] = df["time"].diff().dt.total_seconds().fillna(1.0)
+    df.loc[df["dt"] <= 0, "dt"] = 1.0  # след ресемплиране би трябвало да е 1
 
-    speed = df["ddist"] / df["dt"]
-    alt_rate = df["dalt"] / df["dt"]
+    # Вертикален градиент (преди изглаждане)
+    df["dalt"] = df["altitude"].diff()
+    df["alt_grad"] = df["dalt"].abs() / df["dt"]
 
-    mask = True
-    mask &= (df["dt"].isna() | (df["dt"] > 0))
-    mask &= (df["ddist"].isna() | (df["ddist"] >= 0))
-    mask &= (speed.isna() | ((speed >= 0) & (speed <= MAX_SPEED_M_S)))
-    mask &= (alt_rate.isna() | (abs(alt_rate) <= MAX_ALT_RATE_M_S))
+    # Премахваме точки с огромен вертикален градиент (>= alt_grad_thresh)
+    df.loc[df["alt_grad"] > alt_grad_thresh, "altitude"] = np.nan
+    df["altitude"] = df["altitude"].interpolate(limit_direction="both")
 
-    df = df[mask].copy().reset_index(drop=True)
-    return df[["time", "distance_m", "altitude_m"]]
+    # Изглаждане (moving median, 3 точки)
+    df["alt_smooth"] = (
+        df["altitude"].rolling(window=3, center=True).median().fillna(df["altitude"])
+    )
 
+    # Скорост от дистанция
+    df["distance"] = df["distance"].interpolate(limit_direction="both")
+    df["ddist"] = df["distance"].diff()
+    df["speed_m_s"] = (df["ddist"] / df["dt"]).fillna(0.0)
 
-# ======================================================
-# СРЕДНА СКОРОСТ НА ЦЯЛАТА АКТИВНОСТ
-# ======================================================
-def compute_activity_avg_speed(df):
-    if len(df) < 2:
-        return np.nan
-    dt = (df["time"].iloc[-1] - df["time"].iloc[0]).total_seconds()
-    if dt <= 0:
-        return np.nan
-    dist = df["distance_m"].iloc[-1] - df["distance_m"].iloc[0]
-    if dist <= 0:
-        return np.nan
-    return (dist / dt) * 3.6
+    # Премахваме нереалистично високи скорости
+    v_max = v_max_kmh / 3.6
+    df.loc[df["speed_m_s"].abs() > v_max, "speed_m_s"] = np.nan
+    df["speed_m_s"] = df["speed_m_s"].interpolate(limit_direction="both").fillna(0.0)
 
+    df = df.reset_index(drop=True)
 
-# ======================================================
-# СЕГМЕНТИРАНЕ + Δv + филтри
-# ======================================================
-def segment_activity(df):
-    df = df.copy()
-    df["elapsed_s"] = (df["time"] - df["time"].iloc[0]).dt.total_seconds()
-    df["segment_idx"] = (df["elapsed_s"] // SEGMENT_LENGTH_SEC).astype(int)
+    alt = df["alt_smooth"].values
+    dist = df["distance"].values
+    v = df["speed_m_s"].values
+    times = df["time"].values
 
-    results = []
+    N = len(df)
+    L = int(segment_length_s)
 
-    for seg_idx, g in df.groupby("segment_idx"):
-        g = g.sort_values("time")
+    min_slope = min_slope_pct / 100.0  # преобразуваме от % в десетичен вид
+    prev_min_slope = prev_min_slope_pct / 100.0
+    max_slope_diff = max_slope_diff_pct_points / 100.0
 
-        if len(g) < 2:
+    glide_segments: List[Dict] = []
+
+    # 2) Плъзгащ се прозорец: P = [k-L, k), S = [k, k+L)
+    for k in range(L, N - L):
+        P_start = k - L
+        P_end = k  # exclusive
+        S_start = k
+        S_end = k + L
+
+        # Проверка за NaN в ключовите полета
+        if (
+            np.isnan(alt[P_start])
+            or np.isnan(alt[S_start])
+            or np.isnan(dist[P_start])
+            or np.isnan(dist[S_start])
+        ):
             continue
 
-        t_start = g["time"].iloc[0]
-        t_end = g["time"].iloc[-1]
-        dur = (t_end - t_start).total_seconds()
-        if dur < MIN_SEGMENT_DURATION:
+        # --- Метрики за P ---
+        dh_P = alt[P_start] - alt[P_end - 1]
+        dist_P = dist[P_end - 1] - dist[P_start]
+        if dist_P <= 0:
             continue
 
-        dist = g["distance_m"].iloc[-1] - g["distance_m"].iloc[0]
-        dh = g["altitude_m"].iloc[-1] - g["altitude_m"].iloc[0]
+        mean_slope_P = dh_P / dist_P  # десетично число
+        mean_speed_P = np.nanmean(v[P_start:P_end])
 
-        if dist < MIN_SEGMENT_DISTANCE_M:
+        if dh_P < min_dh_P:
             continue
-        if abs(dh) < MIN_ABS_DELTA_ELEV:
+        if dist_P < min_dist_P:
             continue
-
-        avg_speed_m_s = dist / dur
-        avg_speed_kmh = avg_speed_m_s * 3.6
-        if avg_speed_kmh < MIN_SEGMENT_SPEED_KMH:
+        if mean_slope_P > prev_min_slope:  # трябва да е <= -5%
             continue
 
-        slope = (dh / dist) * 100
-        if abs(slope) > MAX_ABS_SLOPE_PERCENT:
-            continue
-        if slope > MIN_DOWNHILL_SLOPE:
-            continue  # трябва да е ≤ -7%
-
-        # ------------------------------------------------
-        # 1) Проверка за предишните 10 секунди (slope ≤ -5%)
-        # ------------------------------------------------
-        window_start = t_start - pd.Timedelta(seconds=PRE_WINDOW_SEC)
-        prev = df[(df["time"] >= window_start) & (df["time"] < t_start)]
-        if len(prev) < 2:
+        # --- Метрики за S ---
+        dh_S = alt[S_start] - alt[S_end - 1]
+        dist_S = dist[S_end - 1] - dist[S_start]
+        if dist_S <= 0:
             continue
 
-        prev_dist = prev["distance_m"].iloc[-1] - prev["distance_m"].iloc[0]
-        prev_dh = prev["altitude_m"].iloc[-1] - prev["altitude_m"].iloc[0]
-
-        if prev_dist < MIN_PRE_WINDOW_DIST_M:
+        mean_slope_S = dh_S / dist_S
+        mean_speed_S = np.nanmean(v[S_start:S_end])
+        if np.isnan(mean_speed_S) or mean_speed_S <= 0:
             continue
 
-        prev_slope = (prev_dh / prev_dist) * 100
-        if prev_slope > MIN_PRE_WINDOW_SLOPE:
-            continue  # slope трябва да е ≤ -5%
+        # Средна скорост в km/h
+        mean_speed_S_kmh = mean_speed_S * 3.6
 
-        # ------------------------------------------------
-        # 2) Сегментът да е САМО спускане (без локални качвания)
-        # ------------------------------------------------
-        alt_diff = g["altitude_m"].diff().dropna()
-        if (alt_diff > MAX_LOCAL_UPHILL_M).any():
-            continue
-
-        # ------------------------------------------------
-        # 3) Δv (крайна - начална скорост)
-        # ------------------------------------------------
-        dt_start = (g["time"].iloc[1] - g["time"].iloc[0]).total_seconds()
-        dt_end = (g["time"].iloc[-1] - g["time"].iloc[-2]).total_seconds()
-
-        if dt_start > 0:
-            v_start = (g["distance_m"].iloc[1] - g["distance_m"].iloc[0]) / dt_start
+        # Coefficient of variation на скоростта
+        std_v_S = np.nanstd(v[S_start:S_end])
+        if mean_speed_S > 0:
+            cv_v_S = std_v_S / mean_speed_S
         else:
-            v_start = avg_speed_m_s
+            cv_v_S = np.inf
 
-        if dt_end > 0:
-            v_end = (g["distance_m"].iloc[-1] - g["distance_m"].iloc[-2]) / dt_end
-        else:
-            v_end = avg_speed_m_s
+        # Условие за денивелация, дистанция, наклон, скорост
+        if dh_S < min_dh_S:
+            continue
+        if dist_S < min_dist_S:
+            continue
+        if mean_slope_S > min_slope:  # трябва да е <= -5%
+            continue
+        if mean_speed_S_kmh < min_speed_S_kmh:
+            continue
+        if cv_v_S > max_cv_v_S:
+            continue
 
-        dv_m_s = v_end - v_start
-        dv_kmh = dv_m_s * 3.6
+        # Монотонно (почти) спускане в S: alt[i+1] <= alt[i] + eps_h
+        alts_S = alt[S_start:S_end]
+        if np.any(np.diff(alts_S) > eps_h):
+            continue
 
-        results.append({
-            "segment_idx": seg_idx,
-            "t_start": t_start,
-            "duration_s": dur,
-            "segment_distance_m": dist,
-            "delta_elev_m": dh,
-            "avg_speed_kmh": avg_speed_kmh,
-            "slope_percent": slope,
-            "v_start_kmh": v_start * 3.6,
-            "v_end_kmh": v_end * 3.6,
-            "dv_kmh": dv_kmh
-        })
+        # Сходство на наклона между P и S
+        if abs(mean_slope_S - mean_slope_P) > max_slope_diff:
+            continue
 
-    return pd.DataFrame(results)
-
-
-# ======================================================
-# DOWNHILL SUMMARY
-# ======================================================
-def downhill_summary(seg_df):
-    if seg_df.empty:
-        return {
-            "n_segments": 0,
-            "avg_slope": np.nan,
-            "avg_speed": np.nan,
-            "avg_dv": np.nan
+        # Ако стигнем дотук, сегментът е валиден glide-сегмент
+        segment_info = {
+            "start_time": times[S_start],
+            "end_time": times[S_end - 1],
+            "mean_speed_kmh": mean_speed_S_kmh,
+            "mean_slope_pct": mean_slope_S * 100.0,
+            "dh_S": dh_S,
+            "dist_S": dist_S,
         }
+        glide_segments.append(segment_info)
 
-    return {
-        "n_segments": len(seg_df),
-        "avg_slope": seg_df["slope_percent"].mean(),
-        "avg_speed": seg_df["avg_speed_kmh"].mean(),
-        "avg_dv": seg_df["dv_kmh"].mean()
-    }
+    if not glide_segments:
+        return pd.DataFrame()
+
+    seg_df = pd.DataFrame(glide_segments)
+    return seg_df
 
 
-# ======================================================
-# STREAMLIT UI
-# ======================================================
+# ---------- 3) STREAMLIT UI ----------
+
 def main():
-    st.title("Ski-Glide-Dynamics — чисти 10 сек спускания (Δv модел)")
+    st.title("Ski-Glide-Dynamics — Glide Segment Analyzer (10 s / -5%)")
 
-    files = st.file_uploader("Качи един или повече TCX файла",
-                             type=["tcx"],
-                             accept_multiple_files=True)
+    st.write(
+        "Зареди една или повече **TCX активности**. "
+        "Моделът ще намери 10-секундни спускания, които отговарят на "
+        "критериите ни за чисто плъзгане, и ще изчисли средна скорост и наклон."
+    )
 
-    if not files:
+    # --- Sidebar: настройки на модела ---
+    st.sidebar.header("Настройки на модела")
+
+    segment_length_s = st.sidebar.number_input(
+        "Дължина на сегмента (s)", min_value=5, max_value=30, value=10, step=1
+    )
+
+    min_slope_pct = st.sidebar.number_input(
+        "Мин. среден наклон S (в %; напр. -5)",
+        min_value=-30.0,
+        max_value=-1.0,
+        value=-5.0,
+        step=0.5,
+    )
+
+    prev_min_slope_pct = st.sidebar.number_input(
+        "Мин. среден наклон P (в %; напр. -5)",
+        min_value=-30.0,
+        max_value=-1.0,
+        value=-5.0,
+        step=0.5,
+    )
+
+    min_dh_P = st.sidebar.number_input(
+        "Мин. денивелация в P (m)", min_value=0.0, max_value=20.0, value=1.5, step=0.5
+    )
+    min_dh_S = st.sidebar.number_input(
+        "Мин. денивелация в S (m)", min_value=0.0, max_value=20.0, value=2.0, step=0.5
+    )
+
+    min_dist_P = st.sidebar.number_input(
+        "Мин. хор. дистанция в P (m)", min_value=0.0, max_value=200.0, value=20.0, step=5.0
+    )
+    min_dist_S = st.sidebar.number_input(
+        "Мин. хор. дистанция в S (m)", min_value=0.0, max_value=200.0, value=30.0, step=5.0
+    )
+
+    min_speed_S_kmh = st.sidebar.number_input(
+        "Мин. средна скорост S (km/h)",
+        min_value=0.0,
+        max_value=50.0,
+        value=10.0,
+        step=1.0,
+    )
+
+    max_cv_v_S = st.sidebar.number_input(
+        "Макс. CV на скоростта в S",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.15,
+        step=0.01,
+    )
+
+    eps_h = st.sidebar.number_input(
+        "Допустимо покачване на alt в S (ε_h, m)",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.1,
+        step=0.01,
+    )
+
+    max_slope_diff_pct_points = st.sidebar.number_input(
+        "Макс. разлика между slope_P и slope_S (в процентни пункта)",
+        min_value=0.0,
+        max_value=20.0,
+        value=5.0,
+        step=0.5,
+    )
+
+    v_max_kmh = st.sidebar.number_input(
+        "Макс. допустима скорост (km/h)",
+        min_value=10.0,
+        max_value=120.0,
+        value=70.0,
+        step=5.0,
+    )
+
+    alt_grad_thresh = st.sidebar.number_input(
+        "Макс. вертикален градиент (m/s)",
+        min_value=1.0,
+        max_value=20.0,
+        value=5.0,
+        step=0.5,
+    )
+
+    st.sidebar.markdown("---")
+    st.sidebar.caption(
+        "Може да започнем с тези стойности и после да ги прецизираме според резултатите."
+    )
+
+    # --- Качване на файлове ---
+    uploaded_files = st.file_uploader(
+        "Качи TCX файлове (може няколко наведнъж)", type=["tcx"], accept_multiple_files=True
+    )
+
+    if not uploaded_files:
+        st.info("Моля, качи поне един TCX файл.")
         return
 
-    final_rows = []
+    summary_rows = []
+    all_segments = []
 
-    for f in files:
-        try:
-            raw = parse_tcx_bytes(f.read())
-            raw = smooth_altitude(raw)
-            clean = clean_artifacts(raw)
+    for file in uploaded_files:
+        st.subheader(f"Активност: {file.name}")
 
-            avg_activity_speed = compute_activity_avg_speed(clean)
-            seg_df = segment_activity(clean)
-            summary = downhill_summary(seg_df)
+        df = parse_tcx_to_df(file)
+        if df.empty:
+            st.warning("Не успях да прочета валидни данни от този файл.")
+            continue
 
-            final_rows.append({
-                "activity": f.name,
-                "n_segments": summary["n_segments"],
-                "avg_slope_percent": summary["avg_slope"],
-                "avg_downhill_speed_kmh": summary["avg_speed"],
-                "avg_dv_kmh": summary["avg_dv"],
-                "avg_activity_speed_kmh": avg_activity_speed
-            })
+        seg_df = extract_glide_segments(
+            df,
+            segment_length_s=segment_length_s,
+            min_slope_pct=min_slope_pct,
+            prev_min_slope_pct=prev_min_slope_pct,
+            min_dh_P=min_dh_P,
+            min_dh_S=min_dh_S,
+            min_dist_P=min_dist_P,
+            min_dist_S=min_dist_S,
+            min_speed_S_kmh=min_speed_S_kmh,
+            max_cv_v_S=max_cv_v_S,
+            eps_h=eps_h,
+            max_slope_diff_pct_points=max_slope_diff_pct_points,
+            v_max_kmh=v_max_kmh,
+            alt_grad_thresh=alt_grad_thresh,
+        )
 
-        except Exception as e:
-            st.error(f"Грешка при обработка на {f.name}: {e}")
+        if seg_df.empty:
+            st.write("❌ Няма намерени сегменти, които да отговарят на условията.")
+            continue
 
-    df = pd.DataFrame(final_rows)
-    st.subheader("Сравнение на активности")
-    st.dataframe(df)
+        seg_df["activity"] = file.name
+        all_segments.append(seg_df)
+
+        mean_speed = seg_df["mean_speed_kmh"].mean()
+        mean_slope = seg_df["mean_slope_pct"].mean()
+        n_segments = len(seg_df)
+
+        st.write(
+            f"✅ Намерени сегменти: **{n_segments}**  \n"
+            f"Средна скорост на валидните сегменти: **{mean_speed:.2f} km/h**  \n"
+            f"Среден наклон на валидните сегменти: **{mean_slope:.2f} %**"
+        )
+
+        summary_rows.append(
+            {
+                "activity": file.name,
+                "n_segments": n_segments,
+                "mean_speed_kmh": mean_speed,
+                "mean_slope_pct": mean_slope,
+            }
+        )
+
+    if summary_rows:
+        st.markdown("---")
+        st.subheader("Обобщение по активности")
+
+        summary_df = pd.DataFrame(summary_rows)
+        st.dataframe(summary_df, use_container_width=True)
+
+    if all_segments:
+        st.markdown("---")
+        st.subheader("Всички валидни сегменти (подробно)")
+
+        all_seg_df = pd.concat(all_segments, ignore_index=True)
+        # Може да закръглим за по-четливо
+        all_seg_df["mean_speed_kmh"] = all_seg_df["mean_speed_kmh"].round(2)
+        all_seg_df["mean_slope_pct"] = all_seg_df["mean_slope_pct"].round(2)
+        all_seg_df["dh_S"] = all_seg_df["dh_S"].round(2)
+        all_seg_df["dist_S"] = all_seg_df["dist_S"].round(2)
+
+        st.dataframe(all_seg_df, use_container_width=True)
+
 
 if __name__ == "__main__":
     main()
