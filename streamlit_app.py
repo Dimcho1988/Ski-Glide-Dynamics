@@ -87,7 +87,6 @@ def clean_artifacts(
 # ------------------------
 # СЕГМЕНТИРАНЕ В 15s БЛОКОВЕ
 # ------------------------
-
 def segment_activity(
     df: pd.DataFrame,
     segment_length_sec: int,
@@ -99,6 +98,7 @@ def segment_activity(
 ) -> pd.DataFrame:
     """
     Връща DataFrame със сегменти и базови метрики.
+    Ако няма нито един валиден сегмент, връща празен DF без да хвърля KeyError.
     """
     df = df.copy()
     df["elapsed_s"] = (df["time"] - df["time"].iloc[0]).dt.total_seconds()
@@ -146,18 +146,17 @@ def segment_activity(
             "delta_elev_m": delta_elev_m,
             "avg_speed_kmh": avg_speed_kmh,
             "slope_percent": slope_percent,
-            # запазваме индексите в оригиналния df за доп. проверки
             "idx_start": g.index[0],
             "idx_end": g.index[-1],
         })
 
     seg_df = pd.DataFrame(rows)
+
+    # 🔧 FIX: ако няма нито един валиден сегмент, не сортираме по column, която я няма
+    if seg_df.empty:
+        return seg_df
+
     return seg_df.sort_values("segment_idx").reset_index(drop=True)
-
-
-# ------------------------
-# ДОПЪЛНИТЕЛНИ УСЛОВИЯ ЗА GLIDE СЕГМЕНТИ
-# ------------------------
 
 def filter_glide_segments(
     seg_df: pd.DataFrame,
