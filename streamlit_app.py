@@ -343,8 +343,8 @@ if uploaded_files:
             ]
         )
 
-        # Обобщени средни стойности
-        st.subheader("Средни стойности на преминалите сегменти (всички файлове)")
+        # Обобщени средни стойности за всички сегменти (глобално)
+        st.subheader("Глобални средни стойности на преминалите сегменти (всички файлове)")
         mean_speed = segments["mean_speed_kmh"].mean()
         mean_slope = segments["mean_slope_percent"].mean()
         mean_delta_v = segments["delta_v_kmh"].mean()
@@ -357,6 +357,38 @@ if uploaded_files:
         with col2:
             st.metric("Среден наклон (%)", f"{mean_slope:.2f}")
             st.metric("Средно ΔV / |наклон|", f"{mean_dv_per_slope:.4f}")
+
+        # --- НОВО: Обобщителна таблица по активност (файл) ---
+        st.subheader("Обобщителна таблица по активност (по файл)")
+
+        agg_dict = {
+            "seg_idx": "count",
+            "mean_speed_kmh": "mean",
+            "mean_slope_percent": "mean",
+            "delta_v_kmh": "mean",
+            "dv_per_slope_abs": "mean",
+        }
+        if "criterion_factor" in segments.columns:
+            agg_dict["criterion_factor"] = "mean"
+
+        summary_by_file = (
+            segments
+            .groupby("file_name")
+            .agg(agg_dict)
+            .rename(
+                columns={
+                    "seg_idx": "n_segments",
+                    "mean_speed_kmh": "mean_speed_kmh",
+                    "mean_slope_percent": "mean_slope_percent",
+                    "delta_v_kmh": "mean_delta_v_kmh",
+                    "dv_per_slope_abs": "mean_dv_per_slope_abs",
+                    "criterion_factor": "mean_criterion_factor",
+                }
+            )
+            .reset_index()
+        )
+
+        st.dataframe(summary_by_file)
 
         # Фитваме критериен модел
         segments, coeffs = fit_criterion_model(segments)
