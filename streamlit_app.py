@@ -4,18 +4,24 @@ import numpy as np
 import xml.etree.ElementTree as ET
 from io import BytesIO
 import plotly.express as px
+from scipy.signal import savgol_filter  # <-- ново
 
 # ==============================
 # НАСТРОЙКИ НА МОДЕЛА
 # ==============================
 
-SEG_LEN_SEC = 12                 # дължина на сегмента (секунди)
+SEG_LEN_SEC = 10                 # дължина на сегмента (секунди)
 MIN_SEG_DIST_M = 20.0            # минимална дължина на сегмент (метри)
 MIN_SEG_SPEED_KMH = 15.0         # минимална средна скорост в сегмент (km/h)
 MAX_ABS_SLOPE_PCT = 30.0         # макс. абсолютен наклон в % (артефакт филтър)
 MIN_SLOPE_DOWN_PCT = -5.0        # прагов наклон за "достатъчно спускане"
 MIN_POINTS_PER_SEG = 3           # минимален брой точки в сегмент
-ROLLING_ALT_WINDOW = 3           # прозорец за медианно изглаждане на височината
+
+# Savitzky–Golay настройки
+ALT_WINDOW = 51                  # трябва да е нечетно
+ALT_POLY = 2
+SPEED_WINDOW = 21
+SPEED_POLY = 2
 
 # Малък epsilon за стабилизиране на GEI
 GEI_EPS = 0.1
@@ -25,10 +31,32 @@ GEI_EPS = 0.1
 # ПОМОЩНИ ФУНКЦИИ – ПАРСВАНЕ И СЕГМЕНТИ
 # ==============================
 
+def apply_savgol(series: pd.Series, window_length: int, polyorder: int) -> pd.Series:
+    """
+    Помощна функция: безопасно прилага Savitzky–Golay.
+    Ако серията е твърде къса за зададения прозорец, адаптира прозореца
+    или връща леко изгладена rolling медиана.
+    """
+    n = len(series)
+    if n < 3:
+        return series.copy()
+
+    # адаптираме прозореца при твърде малко точки
+    window = window_length
+    if n < window:
+        window = n if n % 2 == 1 else n - 1
+    if window < polyorder + 2:
+        # fallback: rolling медиана
+        return series.rolling(window=3, center=True, min_periods=1).median()
+
+    filtered = savgol_filter(series.values, window_length=window, polyorder=polyorder)
+    return pd.Series(filtered, index=series.index)
+
+
 def parse_tcx(file) -> pd.DataFrame:
     """
     Чете TCX файл и връща DataFrame с колони:
-    time, t_rel, dist, alt, alt_smooth, speed_mps, speed_kmh
+    time, t_rel, dist, alt, speed_kmh, alt_trend, speed_trend
     """
     content = file.read()
     tree = ET.parse(BytesIO(content))
@@ -88,12 +116,15 @@ def parse_tcx(file) -> pd.DataFrame:
     # Филтър за некоректни времеви стъпки
     df = df[df["delta_t"] > 0].copy()
 
-    # Скорост (m/s и km/h)
+    # Скорост (m/s и km/h) – базирана на суровата дистанция
     df["speed_mps"] = df["delta_d"] / df["delta_t"]
     df["speed_kmh"] = df["speed_mps"] * 3.6
 
-    # Сглаждане на височината
-    df["alt_smooth"] = df["alt"].rolling(window=ROLLING_ALT_WINDOW, center=True, min_periods=1).median()
+    # Плаваща тренд-линия със Savitzky–Golay:
+    # - alt_trend: изгладена надморска височина
+    # - speed_trend: изгладена скорост
+    df["alt_trend"] = apply_savgol(df["alt"], ALT_WINDOW, ALT_POLY)
+    df["speed_trend"] = apply_savgol(df["speed_kmh"], SPEED_WINDOW, SPEED_POLY)
 
     df = df.reset_index(drop=True)
 
@@ -104,6 +135,10 @@ def build_segments(df: pd.DataFrame) -> pd.DataFrame:
     """
     Разделя активността на 10-секундни сегменти и връща DataFrame с метрики
     за всички сегменти (преди финалния филтър за предходен сегмент).
+
+    ВАЖНО: всички сегментни метрики (наклон, Δскорост, monotonic_downhill)
+    се изчисляват върху alt_trend и speed_trend (плаващата тренд-линия).
+    Дистанцията остава сурова (dist), за да е монотонно нарастваща.
     """
     if df.empty:
         return pd.DataFrame()
@@ -128,12 +163,12 @@ def build_segments(df: pd.DataFrame) -> pd.DataFrame:
         dist_end = seg["dist"].iloc[-1]
         segment_dist_m = dist_end - dist_start
 
-        # Средна скорост от дистанция и време
+        # Средна скорост от дистанция и време (ползваме суровата дистанция)
         mean_speed_kmh = (segment_dist_m / duration_s) * 3.6 if segment_dist_m > 0 else 0.0
 
-        # Наклон по старт/край върху изгладената височина
-        alt_start = seg["alt_smooth"].iloc[0]
-        alt_end = seg["alt_smooth"].iloc[-1]
+        # Наклон по старт/край върху изгладената височина (trend)
+        alt_start = seg["alt_trend"].iloc[0]
+        alt_end = seg["alt_trend"].iloc[-1]
         delta_h = alt_end - alt_start
 
         if segment_dist_m > 0:
@@ -141,13 +176,13 @@ def build_segments(df: pd.DataFrame) -> pd.DataFrame:
         else:
             slope_pct = np.nan
 
-        # Монотонично спускане: всички Δalt <= 0
-        alt_diff = seg["alt_smooth"].diff().dropna()
+        # Монотонично спускане: всички Δalt_trend <= 0
+        alt_diff = seg["alt_trend"].diff().dropna()
         monotonic_downhill = bool((alt_diff <= 0).all()) if not alt_diff.empty else False
 
-        # Реални скорости в началото и края
-        start_speed_kmh = seg["speed_kmh"].iloc[0]
-        end_speed_kmh = seg["speed_kmh"].iloc[-1]
+        # Реални скорости в началото и края – по изгладената скорост
+        start_speed_kmh = seg["speed_trend"].iloc[0]
+        end_speed_kmh = seg["speed_trend"].iloc[-1]
         delta_speed_kmh = end_speed_kmh - start_speed_kmh
 
         # Базов филтър за артефакти
@@ -239,8 +274,7 @@ def fit_regression_surface(df: pd.DataFrame):
     if reg_df.empty:
         return None
 
-    # По желание може да сложим прост outlier-филтър върху delta_speed
-    # напр. |Δv| < 30 km/h, за да не се влияе от абсурдни стойности.
+    # прост outlier-филтър върху delta_speed
     reg_df = reg_df[reg_df["delta_speed_kmh"].between(-30, 30)]
 
     if len(reg_df) < 10:
@@ -288,10 +322,6 @@ def compute_gei(delta_real, delta_expected, eps=GEI_EPS):
     """
     Изчислява Glide Efficiency Index (GEI) за всеки сегмент:
     GEI = 1 - (Δv_expected - Δv_real) / (|Δv_expected| + eps)
-
-    - GEI ~ 1     → плъзгаемостта е близка до "очакваната"
-    - GEI < 1     → по-лоша плъзгаемост (реалната Δv е по-малка от очакваната)
-    - GEI > 1     → по-добра от модела (много добър сняг / wax)
     """
     delta_real = np.array(delta_real)
     delta_expected = np.array(delta_expected)
@@ -312,17 +342,17 @@ st.write(
     """
 Анализ на TCX ски/ролери активности:
 
-1. Почистване на данните и изглаждане на височината  
-2. Разделяне на **12-секундни сегменти**  
-3. Избор на сегменти с:
+1. Почистване на данните  
+2. Изграждане на **плаваща тренд-линия** (Savitzky–Golay) за височина и скорост  
+3. Разделяне на **10-секундни сегменти**  
+4. Избор на сегменти с:
    - наклон ≤ -5%  
    - предходен сегмент също с наклон ≤ -5%  
-   - само намаляваща денивелация в рамките на сегмента  
+   - само намаляваща денивелация (по alt_trend)  
    - средна скорост ≥ 15 km/h и дължина ≥ 20 m  
 
-Върху всички избрани сегменти от **всички качени активности** се фитва
-квадратична повърхност:
-Δv = f(slope, speed), от която се извежда **Glide Efficiency Index (GEI)**.
+Върху всички избрани сегменти от всички активности се фитва
+квадратична повърхност Δv = f(slope, speed) и се изчислява GEI.
 """
 )
 
@@ -425,7 +455,7 @@ st.dataframe(
 )
 
 if all_selected_df.empty:
-    st.warning("Няма сегменти, които да отговарят на всички критерии (наклон, предходен сегмент, монотонично спускане и т.н.).")
+    st.warning("Няма сегменти, които да отговарят на всички критерии.")
     st.stop()
 
 st.subheader("Сегменти, преминали финалния филтър (по всички критерии)")
@@ -534,10 +564,9 @@ else:
     )
     st.plotly_chart(fig_3d, use_container_width=True)
 
-    # Генерираме гладка повърхност от модела за визуализация (по желание)
+    # Моделна повърхност за визуализация
     st.subheader("Моделна повърхност (Δскорост според регресията)")
 
-    # Определяме диапазони за slope и speed от данните
     s_min, s_max = all_selected_df["slope_pct"].min(), all_selected_df["slope_pct"].max()
     v_min, v_max = all_selected_df["mean_speed_kmh"].min(), all_selected_df["mean_speed_kmh"].max()
 
