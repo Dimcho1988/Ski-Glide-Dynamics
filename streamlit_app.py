@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import xml.etree.ElementTree as ET
 from io import BytesIO
+import plotly.express as px
 
 # ==============================
 # НАСТРОЙКИ НА МОДЕЛА
@@ -16,9 +17,12 @@ MIN_SLOPE_DOWN_PCT = -5.0        # прагов наклон за "достат�
 MIN_POINTS_PER_SEG = 3           # минимален брой точки в сегмент
 ROLLING_ALT_WINDOW = 3           # прозорец за медианно изглаждане на височината
 
+# Малък epsilon за стабилизиране на GEI
+GEI_EPS = 0.1
+
 
 # ==============================
-# ПОМОЩНИ ФУНКЦИИ
+# ПОМОЩНИ ФУНКЦИИ – ПАРСВАНЕ И СЕГМЕНТИ
 # ==============================
 
 def parse_tcx(file) -> pd.DataFrame:
@@ -221,21 +225,104 @@ def select_final_segments(seg_df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ==============================
+# РЕГРЕСИОННА ПОВЪРХНОСТ Δv = f(slope, speed)
+# ==============================
+
+def fit_regression_surface(df: pd.DataFrame):
+    """
+    Фитва квадратична повърхност:
+    Δv = b0 + b1*s + b2*v + b3*s^2 + b4*v^2 + b5*s*v
+    където s = slope_pct, v = mean_speed_kmh.
+    Връща вектор коефициенти beta с дължина 6.
+    """
+    reg_df = df.dropna(subset=["slope_pct", "mean_speed_kmh", "delta_speed_kmh"]).copy()
+    if reg_df.empty:
+        return None
+
+    # По желание може да сложим прост outlier-филтър върху delta_speed
+    # напр. |Δv| < 30 km/h, за да не се влияе от абсурдни стойности.
+    reg_df = reg_df[reg_df["delta_speed_kmh"].between(-30, 30)]
+
+    if len(reg_df) < 10:
+        # твърде малко точки за смислена регресия
+        return None
+
+    s = reg_df["slope_pct"].values
+    v = reg_df["mean_speed_kmh"].values
+    y = reg_df["delta_speed_kmh"].values
+
+    X = np.column_stack(
+        [
+            np.ones_like(s),  # b0
+            s,                # b1
+            v,                # b2
+            s ** 2,           # b3
+            v ** 2,           # b4
+            s * v,            # b5
+        ]
+    )
+
+    beta, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+    return beta
+
+
+def predict_delta_speed(beta, slope, speed):
+    """
+    Предсказва Δv при дадени slope и speed според регресионната повърхност.
+    slope и speed могат да са numpy масиви.
+    """
+    s = np.array(slope)
+    v = np.array(speed)
+
+    return (
+        beta[0]
+        + beta[1] * s
+        + beta[2] * v
+        + beta[3] * s ** 2
+        + beta[4] * v ** 2
+        + beta[5] * s * v
+    )
+
+
+def compute_gei(delta_real, delta_expected, eps=GEI_EPS):
+    """
+    Изчислява Glide Efficiency Index (GEI) за всеки сегмент:
+    GEI = 1 - (Δv_expected - Δv_real) / (|Δv_expected| + eps)
+
+    - GEI ~ 1     → плъзгаемостта е близка до "очакваната"
+    - GEI < 1     → по-лоша плъзгаемост (реалната Δv е по-малка от очакваната)
+    - GEI > 1     → по-добра от модела (много добър сняг / wax)
+    """
+    delta_real = np.array(delta_real)
+    delta_expected = np.array(delta_expected)
+
+    delta_loss = delta_expected - delta_real
+    denom = np.abs(delta_expected) + eps
+    gei = 1.0 - delta_loss / denom
+    return gei
+
+
+# ==============================
 # STREAMLIT UI
 # ==============================
 
-st.title("Ski Glide Dynamics – сегментен анализ при спускане")
+st.title("Ski Glide Dynamics – сегментен анализ и 3D модел на плъзгаемостта")
+
 st.write(
     """
 Анализ на TCX ски/ролери активности:
 
 1. Почистване на данните и изглаждане на височината  
-2. Разделяне на 10-секундни сегменти  
+2. Разделяне на **10-секундни сегменти**  
 3. Избор на сегменти с:
    - наклон ≤ -5%  
    - предходен сегмент също с наклон ≤ -5%  
    - само намаляваща денивелация в рамките на сегмента  
-   - средна скорост ≥ 15 km/h и дължина ≥ 20 m
+   - средна скорост ≥ 15 km/h и дължина ≥ 20 m  
+
+Върху всички избрани сегменти от **всички качени активности** се фитва
+квадратична повърхност:
+Δv = f(slope, speed), от която се извежда **Glide Efficiency Index (GEI)**.
 """
 )
 
@@ -339,27 +426,76 @@ st.dataframe(
 
 if all_selected_df.empty:
     st.warning("Няма сегменти, които да отговарят на всички критерии (наклон, предходен сегмент, монотонично спускане и т.н.).")
+    st.stop()
+
+st.subheader("Сегменти, преминали финалния филтър (по всички критерии)")
+st.dataframe(
+    all_selected_df[
+        [
+            "file_name",
+            "seg_id",
+            "t_start_s",
+            "t_end_s",
+            "duration_s",
+            "segment_dist_m",
+            "mean_speed_kmh",
+            "slope_pct",
+            "start_speed_kmh",
+            "end_speed_kmh",
+            "delta_speed_kmh",
+        ]
+    ]
+)
+
+# ==============================
+# РЕГРЕСИОНЕН МОДЕЛ Δv = f(slope, speed) + GEI
+# ==============================
+
+st.header("3D модел на плъзгаемостта и Glide Efficiency Index")
+
+beta = fit_regression_surface(all_selected_df)
+
+if beta is None:
+    st.warning(
+        "Няма достатъчно стабилни данни за фитване на регресионна повърхност "
+        "(или твърде малко сегменти след outlier-филтъра)."
+    )
 else:
-    st.subheader("Сегменти, преминали финалния филтър (по всички критерии)")
+    st.markdown("**Коефициенти на регресионния модел (Δv = f(slope, speed))**")
+    coef_labels = ["b0 (const)", "b1 (slope)", "b2 (speed)", "b3 (slope²)", "b4 (speed²)", "b5 (slope*speed)"]
+    coef_df = pd.DataFrame({"coef": coef_labels, "value": beta})
+    st.table(coef_df)
+
+    # Предсказана Δскорост за всеки избран сегмент
+    all_selected_df["delta_speed_pred_kmh"] = predict_delta_speed(
+        beta,
+        all_selected_df["slope_pct"],
+        all_selected_df["mean_speed_kmh"],
+    )
+
+    # GEI за всеки сегмент
+    all_selected_df["gei"] = compute_gei(
+        all_selected_df["delta_speed_kmh"],
+        all_selected_df["delta_speed_pred_kmh"],
+        eps=GEI_EPS,
+    )
+
+    st.subheader("Избрани сегменти с предсказана Δскорост и GEI")
     st.dataframe(
         all_selected_df[
             [
                 "file_name",
                 "seg_id",
-                "t_start_s",
-                "t_end_s",
-                "duration_s",
-                "segment_dist_m",
                 "mean_speed_kmh",
                 "slope_pct",
-                "start_speed_kmh",
-                "end_speed_kmh",
                 "delta_speed_kmh",
+                "delta_speed_pred_kmh",
+                "gei",
             ]
         ]
     )
 
-    # Сводна таблица по файл
+    # Своден анализ по файл
     summary = (
         all_selected_df.groupby("file_name")
         .agg(
@@ -367,10 +503,68 @@ else:
             mean_speed_kmh=("mean_speed_kmh", "mean"),
             mean_slope_pct=("slope_pct", "mean"),
             mean_delta_speed_kmh=("delta_speed_kmh", "mean"),
-            mean_dist_m=("segment_dist_m", "mean"),
+            mean_delta_speed_pred_kmh=("delta_speed_pred_kmh", "mean"),
+            mean_gei=("gei", "mean"),
         )
         .reset_index()
     )
 
     st.subheader("Своден анализ по файл (само избраните сегменти)")
     st.dataframe(summary)
+
+    # ==============================
+    # 3D ВИЗУАЛИЗАЦИЯ
+    # ==============================
+
+    st.subheader("3D визуализация: Δскорост спрямо наклон и средна скорост")
+
+    fig_3d = px.scatter_3d(
+        all_selected_df,
+        x="slope_pct",
+        y="mean_speed_kmh",
+        z="delta_speed_kmh",
+        color="gei",
+        labels={
+            "slope_pct": "Наклон (%)",
+            "mean_speed_kmh": "Средна скорост (km/h)",
+            "delta_speed_kmh": "Δскорост (край - старт) (km/h)",
+            "gei": "Glide Efficiency Index",
+        },
+        title="Реални сегменти: Δскорост vs. наклон и скорост (оцветени по GEI)",
+    )
+    st.plotly_chart(fig_3d, use_container_width=True)
+
+    # Генерираме гладка повърхност от модела за визуализация (по желание)
+    st.subheader("Моделна повърхност (Δскорост според регресията)")
+
+    # Определяме диапазони за slope и speed от данните
+    s_min, s_max = all_selected_df["slope_pct"].min(), all_selected_df["slope_pct"].max()
+    v_min, v_max = all_selected_df["mean_speed_kmh"].min(), all_selected_df["mean_speed_kmh"].max()
+
+    s_grid = np.linspace(s_min, s_max, 40)
+    v_grid = np.linspace(v_min, v_max, 40)
+    S, V = np.meshgrid(s_grid, v_grid)
+    Z = predict_delta_speed(beta, S, V)
+
+    surface_df = pd.DataFrame(
+        {
+            "slope_pct": S.ravel(),
+            "mean_speed_kmh": V.ravel(),
+            "delta_speed_pred_kmh": Z.ravel(),
+        }
+    )
+
+    fig_surface = px.scatter_3d(
+        surface_df,
+        x="slope_pct",
+        y="mean_speed_kmh",
+        z="delta_speed_pred_kmh",
+        opacity=0.6,
+        labels={
+            "slope_pct": "Наклон (%)",
+            "mean_speed_kmh": "Средна скорост (km/h)",
+            "delta_speed_pred_kmh": "Предсказана Δскорост (km/h)",
+        },
+        title="Регресионна повърхност (Δскорост = f(наклон, скорост))",
+    )
+    st.plotly_chart(fig_surface, use_container_width=True)
