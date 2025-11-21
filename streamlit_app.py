@@ -13,8 +13,10 @@ MAX_SLOPE_PERCENT = -5.0       # сегментите за модела тряб
 MIN_SEGMENT_DISTANCE_M = 5.0   # минимална хоризонтална дистанция, за да не е шум
 
 # Процент за отрязване на екстремни стойности на V/|slope|
-# 0.05 = отрязваме по 5% отдолу и отгоре (общо 10%)
-RATIO_TRIM_Q = 0.03
+RATIO_TRIM_Q = 0.05            # 5% отдолу и 5% отгоре
+
+# Начална стойност на фактора за приближаване на коефициента към 1
+GLIDE_ADJUST_FACTOR_DEFAULT = 0.6
 
 
 # -----------------------
@@ -201,11 +203,25 @@ def fit_speed_vs_slope_model(all_segments: pd.DataFrame):
         return None, None
 
 
+def adjust_coeff(raw_coeff: float, factor: float) -> float:
+    """
+    Регулира коефициента към 1:
+    K_adj = 1 + factor * (K_raw - 1)
+
+    factor = 1.0  -> без промяна
+    factor = 0.0  -> K_adj = 1 (пълно игнориране)
+    """
+    if np.isnan(raw_coeff):
+        return np.nan
+    return 1.0 + factor * (raw_coeff - 1.0)
+
+
 def compute_activity_summary(activity_name: str,
                              df_raw: pd.DataFrame,
                              seg_valid: pd.DataFrame,
                              a: float,
-                             b: float) -> dict:
+                             b: float,
+                             factor: float) -> dict:
     """
     Обобщение за една активност.
     """
@@ -223,7 +239,8 @@ def compute_activity_summary(activity_name: str,
             "mean_slope_valid": np.nan,
             "mean_speed_valid": np.nan,
             "model_speed_at_mean_slope": np.nan,
-            "glide_coeff": np.nan,
+            "glide_coeff_raw": np.nan,
+            "glide_coeff_adj": np.nan,
             "overall_speed": overall_speed,
             "normalized_overall_speed": np.nan,
         }
@@ -233,11 +250,16 @@ def compute_activity_summary(activity_name: str,
     model_speed = a * mean_slope + b
 
     if model_speed <= 0:
-        glide_coeff = np.nan
+        glide_raw = np.nan
+        glide_adj = np.nan
         norm_overall = np.nan
     else:
-        glide_coeff = mean_speed / model_speed
-        norm_overall = overall_speed / glide_coeff if glide_coeff not in (0, np.nan) else np.nan
+        # суров коефициент K_raw = V_real / V_model
+        glide_raw = mean_speed / model_speed
+        # регулиран коефициент
+        glide_adj = adjust_coeff(glide_raw, factor)
+        # приравняване на средната скорост на цялата активност
+        norm_overall = overall_speed / glide_adj if glide_adj not in (0, np.nan) else np.nan
 
     return {
         "activity": activity_name,
@@ -245,7 +267,8 @@ def compute_activity_summary(activity_name: str,
         "mean_slope_valid": mean_slope,
         "mean_speed_valid": mean_speed,
         "model_speed_at_mean_slope": model_speed,
-        "glide_coeff": glide_coeff,
+        "glide_coeff_raw": glide_raw,
+        "glide_coeff_adj": glide_adj,
         "overall_speed": overall_speed,
         "normalized_overall_speed": norm_overall,
     }
@@ -271,13 +294,24 @@ def main():
            **{int(RATIO_TRIM_Q*100)}% отдолу и отгоре**, за да не развалят средните.
         4. Строим линейна зависимост:
            \\( V = a \\cdot slope\\_% + b \\).
-        5. За всяка активност намираме:
-           - реална средна скорост на валидните сегменти,
-           - моделна скорост при същия среден наклон,
-           - коефициент на плъзгане \\(K = V_{{real}} / V_{{model}}\\),
+        5. За всяка активност:
+           - намираме средна реална скорост на валидните сегменти,
+           - моделна скорост при същия наклон,
+           - суров коефициент на плъзгане \\(K_{{raw}} = V_{{real}}/V_{{model}}\\),
+           - регулиран коефициент \\(K_{{adj}}\\), който се доближава към 1
+             според избрания фактор,
            - нормализирана средна скорост за цялата активност
-             \\( V_{{norm}} = V_{{overall}} / K \\).
+             \\( V_{{norm}} = V_{{overall}} / K_{{adj}} \\).
         """
+    )
+
+    # Фактор за регулиране на влиянието – можеш да го пипаш по време на работа
+    factor = st.number_input(
+        "Фактор за приближаване на коефициента към 1 (0 = без влияние, 1 = пълно влияние)",
+        min_value=0.0,
+        max_value=1.0,
+        value=GLIDE_ADJUST_FACTOR_DEFAULT,
+        step=0.05,
     )
 
     uploaded_files = st.file_uploader(
@@ -326,7 +360,7 @@ def main():
 
     all_valid_segments = pd.concat(all_valid_segments, ignore_index=True)
 
-    # 2) Филтър по отношение скорост/наклон
+    # 2) Филтър по отношение скорост/|наклон|
     st.markdown("### Филтър по отношение скорост / |наклон|")
     before_n = len(all_valid_segments)
     all_valid_segments, r_low, r_high = filter_by_speed_slope_ratio(all_valid_segments)
@@ -362,12 +396,12 @@ def main():
     st.write(f"**a = {a:.4f} (km/h на 1% наклон)**")
     st.write(f"**b = {b:.4f} (km/h при 0% наклон по модела)**")
 
-    # 4) Обобщение по активности (използваме само сегментите след всички филтри)
+    # 4) Обобщение по активности
     summaries = []
     for name, df_raw in raw_by_activity.items():
         seg_act = all_valid_segments[all_valid_segments["activity"] == name].copy()
         seg_act = seg_act.drop(columns=["activity"]) if not seg_act.empty else seg_act
-        summary = compute_activity_summary(name, df_raw, seg_act, a, b)
+        summary = compute_activity_summary(name, df_raw, seg_act, a, b, factor)
         if summary is not None:
             summaries.append(summary)
 
@@ -383,7 +417,8 @@ def main():
             "mean_slope_valid",
             "mean_speed_valid",
             "model_speed_at_mean_slope",
-            "glide_coeff",
+            "glide_coeff_raw",
+            "glide_coeff_adj",
             "overall_speed",
             "normalized_overall_speed",
         ]
@@ -392,9 +427,10 @@ def main():
     st.markdown("## Обобщение по активности")
     st.markdown(
         """
-        - **glide_coeff** – коефициент на плъзгане \\(K = V_{real}/V_{model}\\).
+        - **glide_coeff_raw** – суров коефициент на плъзгане \\(K_{raw} = V_{real}/V_{model}\\).
+        - **glide_coeff_adj** – регулиран коефициент, придърпан към 1 с избрания фактор.
         - **normalized_overall_speed** – средна скорост на цялата активност,
-          приравнена към „референтна“ плъзгаемост (по модела).
+          приравнена към референтна плъзгаемост (използва K_adj).
         """
     )
 
@@ -403,13 +439,14 @@ def main():
             "mean_slope_valid": "{:.2f}",
             "mean_speed_valid": "{:.2f}",
             "model_speed_at_mean_slope": "{:.2f}",
-            "glide_coeff": "{:.3f}",
+            "glide_coeff_raw": "{:.3f}",
+            "glide_coeff_adj": "{:.3f}",
             "overall_speed": "{:.2f}",
             "normalized_overall_speed": "{:.2f}",
         }
     ))
 
-    # 5) Scatter V vs slope – без matplotlib
+    # 5) Scatter V vs slope
     st.markdown("### Разпределение на скоростта спрямо наклона (валидни сегменти)")
     chart_df = all_valid_segments[["slope_percent", "speed_kmh"]]
     st.scatter_chart(chart_df, x="slope_percent", y="speed_kmh")
