@@ -327,17 +327,17 @@ V_{{mean}} \\approx a + b_{{slope}} \\cdot slope
                 # 4) 2D визуализация: скорост срещу наклон
                 st.subheader("Зависимост скорост – наклон (използвани сегменти)")
                 fig = px.scatter(
-                    segments_trimmed,
-                    x="mean_slope_percent",
-                    y="mean_speed_kmh",
-                    color="file_name",
-                    labels={
-                        "mean_slope_percent": "Среден наклон (%)",
-                        "mean_speed_kmh": "Средна скорост (km/h)",
-                        "file_name": "Активност",
-                    },
-                    trendline="ols",  # ще добави регресионна права (само за визуализация)
-                )
+    segments_trimmed,
+    x="mean_slope_percent",
+    y="mean_speed_kmh",
+    color="file_name",
+    labels={
+        "mean_slope_percent": "Среден наклон (%)",
+        "mean_speed_kmh": "Средна скорост (km/h)",
+        "file_name": "Активност",
+    }
+)
+
                 st.plotly_chart(fig, use_container_width=True)
 
                 # 5) Оценъчен модел за всяка активност
