@@ -2,30 +2,49 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import xml.etree.ElementTree as ET
-from datetime import datetime
+import altair as alt
 
 # -----------------------
-# НАСТРОЙКИ НА МОДЕЛА
+# НАСТРОЙКИ (КОНСТАНТИ)
 # -----------------------
+
+# Обща сегментация
 SEGMENT_LENGTH_SEC = 5.0       # 5-секундни сегменти
-MIN_SLOPE_PERCENT = -15.0      # не допускаме по-стръмно от -15%
-MAX_SLOPE_PERCENT = -5.0       # сегментите за модела трябва да са със среден наклон <= -5%
-MIN_SEGMENT_DISTANCE_M = 5.0   # минимална хоризонтална дистанция, за да не е шум
+MIN_SEGMENT_DISTANCE_M = 5.0   # мин. хоризонтална дистанция в сегмент
 
-# Процент за отрязване на екстремни стойности на V/|slope|
-RATIO_TRIM_Q = 0.05            # 5% отдолу и 5% отгоре
+# Модел 1: Ski Glide Dynamics – V = f(% наклон) (само спускания)
+DOWNHILL_MIN_SLOPE = -15.0     # минимален наклон за сегментите в модела
+DOWNHILL_MAX_SLOPE = -5.0      # максимален наклон за сегментите в модела
+RATIO_TRIM_Q = 0.05            # 5% отрязване на екстремни V/|slope|
 
-# Начална стойност на фактора за приближаване на коефициента към 1
-GLIDE_ADJUST_FACTOR_DEFAULT = 0.6
+# Модел 2: Влияние на наклона при еднакво усилие (ΔV%)
+FLAT_REF_SLOPE_MAX = 1.0       # |slope| <= 1% = "равен терен"
+SLOPE_MODEL_MIN = -3.0         # долна граница за наклон в модела ΔV%
+SLOPE_MODEL_MAX = 10.0         # горна граница за наклон в модела ΔV%
+GLOBAL_SLOPE_LIMIT = 30.0      # режем екстреми |slope| > 30%
+
+# Модел 3: Зони спрямо критична скорост (CS)
+DOWNHILL_RELAX_SLOPE = -3.0    # slope <= -3% → натоварване в горна граница на Z1
+
+# Зони като кратни на критичната скорост (V / CS)
+ZONES = [
+    (0.00, 0.80, "Z1"),
+    (0.80, 0.90, "Z2"),
+    (0.90, 1.00, "Z3"),
+    (1.00, 1.10, "Z4"),
+    (1.10, 1.20, "Z5"),
+    (1.20, 99.0, "Z6"),
+]
 
 
 # -----------------------
-# ПОМОЩНИ ФУНКЦИИ
+# ПОМОЩНИ ФУНКЦИИ – ОБЩИ
 # -----------------------
+
 def parse_tcx(file) -> pd.DataFrame:
     """
-    Парсва TCX файл и връща DataFrame с:
-    time (datetime), alt (m), dist (m), elapsed_s (sec)
+    Парсва TCX файл и връща DataFrame с колони:
+    time (datetime), alt (m), dist (m), elapsed_s (sec).
     """
     try:
         tree = ET.parse(file)
@@ -72,11 +91,13 @@ def parse_tcx(file) -> pd.DataFrame:
 
 def build_segments(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Разделя активността на 5-секундни сегменти (последователни, не припокриващи се).
+    Разделя активността на 5-секундни сегменти (последователни, без припокриване)
+    и изчислява среден наклон и скорост за всеки сегмент.
     """
     if df.empty or len(df) < 2:
         return pd.DataFrame()
 
+    df = df.copy()
     df["seg_id"] = (df["elapsed_s"] // SEGMENT_LENGTH_SEC).astype(int)
 
     seg_rows = []
@@ -124,21 +145,24 @@ def build_segments(df: pd.DataFrame) -> pd.DataFrame:
     return seg_df
 
 
-def filter_segments_with_predecessor(seg_df: pd.DataFrame) -> pd.DataFrame:
+# -----------------------
+# МОДЕЛ 1: SKI GLIDE – DOWNHILL
+# -----------------------
+
+def filter_downhill_with_predecessor(seg_df: pd.DataFrame) -> pd.DataFrame:
     """
-    1) Наклон в диапазона [-15%, -5%].
-    2) Всеки сегмент трябва да е предхождан от сегмент (seg_id - 1)
-       със същия диапазон на наклона.
+    За Ski Glide модела:
+    1) Сегменти с наклон между DOWNHILL_MIN_SLOPE и DOWNHILL_MAX_SLOPE.
+    2) Всеки сегмент трябва да е предхождан от сегмент със същия диапазон на наклона.
     """
     if seg_df.empty:
         return seg_df
 
     base_mask = (
-        (seg_df["slope_percent"] >= MIN_SLOPE_PERCENT)
-        & (seg_df["slope_percent"] <= MAX_SLOPE_PERCENT)
+        (seg_df["slope_percent"] >= DOWNHILL_MIN_SLOPE)
+        & (seg_df["slope_percent"] <= DOWNHILL_MAX_SLOPE)
     )
     seg_df = seg_df[base_mask].copy()
-
     if seg_df.empty:
         return seg_df
 
@@ -149,13 +173,13 @@ def filter_segments_with_predecessor(seg_df: pd.DataFrame) -> pd.DataFrame:
     for _, row in seg_df.iterrows():
         sid = row["seg_id"]
         prev_id = sid - 1
-
         prev_slope = slope_by_id.get(prev_id, None)
+
         if prev_slope is None:
             valid_mask.append(False)
             continue
 
-        if MIN_SLOPE_PERCENT <= prev_slope <= MAX_SLOPE_PERCENT:
+        if DOWNHILL_MIN_SLOPE <= prev_slope <= DOWNHILL_MAX_SLOPE:
             valid_mask.append(True)
         else:
             valid_mask.append(False)
@@ -165,13 +189,13 @@ def filter_segments_with_predecessor(seg_df: pd.DataFrame) -> pd.DataFrame:
     return seg_df
 
 
-def filter_by_speed_slope_ratio(all_segments: pd.DataFrame, q: float = RATIO_TRIM_Q):
+def trim_by_speed_slope_ratio(all_segments: pd.DataFrame, q: float = RATIO_TRIM_Q):
     """
-    Отрязва екстремни сегменти според R = V / |slope|.
-    Оставя сегментите между q и (1-q) персентил.
+    За downhill сегменти: режем екстремни R = V / |slope|.
+    Оставяме сегментите между q и (1-q) персентил.
     """
     if all_segments.empty or len(all_segments) < 10:
-        return all_segments, None, None  # твърде малко данни – не режем
+        return all_segments, None, None
 
     segs = all_segments.copy()
     segs["speed_per_abs_slope"] = segs["speed_kmh"] / segs["slope_percent"].abs()
@@ -182,20 +206,16 @@ def filter_by_speed_slope_ratio(all_segments: pd.DataFrame, q: float = RATIO_TRI
 
     mask = (segs["speed_per_abs_slope"] >= r_low) & (segs["speed_per_abs_slope"] <= r_high)
     segs = segs[mask].copy()
-
     return segs, r_low, r_high
 
 
-def fit_speed_vs_slope_model(all_segments: pd.DataFrame):
-    """
-    Линейна регресия: V = a * slope_percent + b
-    """
+def fit_linear_speed_slope(all_segments: pd.DataFrame):
+    """Линейна регресия V = a * slope_percent + b."""
     if all_segments.empty or len(all_segments) < 5:
         return None, None
 
     x = all_segments["slope_percent"].values
     y = all_segments["speed_kmh"].values
-
     try:
         a, b = np.polyfit(x, y, 1)
         return a, b
@@ -203,116 +223,290 @@ def fit_speed_vs_slope_model(all_segments: pd.DataFrame):
         return None, None
 
 
-def adjust_coeff(raw_coeff: float, factor: float) -> float:
-    """
-    Регулира коефициента към 1:
-    K_adj = 1 + factor * (K_raw - 1)
+def show_ski_glide_model(downhill_segments_list):
+    """Показва модел 1: Ski Glide Dynamics."""
+    st.subheader("Модел 1: Ski Glide Dynamics – V = f(% наклон) (спускане)")
 
-    factor = 1.0  -> без промяна
-    factor = 0.0  -> K_adj = 1 (пълно игнориране)
-    """
-    if np.isnan(raw_coeff):
-        return np.nan
-    return 1.0 + factor * (raw_coeff - 1.0)
+    if not downhill_segments_list:
+        st.warning("Няма достатъчно downhill сегменти (−15% до −5%) за модела.")
+        return
 
+    down = pd.concat(downhill_segments_list, ignore_index=True)
 
-def compute_activity_summary(activity_name: str,
-                             df_raw: pd.DataFrame,
-                             seg_valid: pd.DataFrame,
-                             a: float,
-                             b: float,
-                             factor: float) -> dict:
-    """
-    Обобщение за една активност.
-    """
-    if df_raw.empty:
-        return None
+    # Филтър по V/|slope|
+    down_trimmed, r_low, r_high = trim_by_speed_slope_ratio(down)
 
-    total_dist = df_raw["dist"].iloc[-1] - df_raw["dist"].iloc[0]
-    total_time = df_raw["elapsed_s"].iloc[-1] - df_raw["elapsed_s"].iloc[0]
-    overall_speed = (total_dist / total_time) * 3.6 if total_time > 0 else np.nan
+    if r_low is not None:
+        st.write(
+            f"Downhill сегменти преди филтъра: {len(down)}, "
+            f"след филтъра: {len(down_trimmed)}"
+        )
+        st.write(
+            f"Допуснат диапазон V/|slope|: {r_low:.2f} – {r_high:.2f} km/h на 1% наклон."
+        )
 
-    if seg_valid.empty or a is None or b is None:
-        return {
-            "activity": activity_name,
-            "n_segments": 0,
-            "mean_slope_valid": np.nan,
-            "mean_speed_valid": np.nan,
-            "model_speed_at_mean_slope": np.nan,
-            "glide_coeff_raw": np.nan,
-            "glide_coeff_adj": np.nan,
-            "overall_speed": overall_speed,
-            "normalized_overall_speed": np.nan,
-        }
-
-    mean_slope = seg_valid["slope_percent"].mean()
-    mean_speed = seg_valid["speed_kmh"].mean()
-    model_speed = a * mean_slope + b
-
-    if model_speed <= 0:
-        glide_raw = np.nan
-        glide_adj = np.nan
-        norm_overall = np.nan
-    else:
-        # суров коефициент K_raw = V_real / V_model
-        glide_raw = mean_speed / model_speed
-        # регулиран коефициент
-        glide_adj = adjust_coeff(glide_raw, factor)
-        # приравняване на средната скорост на цялата активност
-        norm_overall = overall_speed / glide_adj if glide_adj not in (0, np.nan) else np.nan
-
-    return {
-        "activity": activity_name,
-        "n_segments": int(len(seg_valid)),
-        "mean_slope_valid": mean_slope,
-        "mean_speed_valid": mean_speed,
-        "model_speed_at_mean_slope": model_speed,
-        "glide_coeff_raw": glide_raw,
-        "glide_coeff_adj": glide_adj,
-        "overall_speed": overall_speed,
-        "normalized_overall_speed": norm_overall,
-    }
-
-
-# -----------------------
-# STREAMLIT UI
-# -----------------------
-def main():
-    st.title("Ski Glide Dynamics – модел V = f(% наклон)")
+    # Линеен модел
+    a, b = fit_linear_speed_slope(down_trimmed)
+    if a is None:
+        st.error("Не успях да построя линейния модел V = a*slope + b.")
+        return
 
     st.markdown(
         f"""
-        **Логика на модела**
+        **Линеен модел за скорост при спускане:**
 
-        1. Зареждаш няколко **TCX файла** от ски бягане.
-        2. За всяка активност:
-           - разделяме на 5-секундни сегменти;
-           - избираме само сегменти с наклон между **{MIN_SLOPE_PERCENT}% и {MAX_SLOPE_PERCENT}%**,
-             които са предхождани от сегмент със същия диапазон.
-        3. От всички валидни сегменти изчисляваме
-           \\( R = V / |slope\\_%| \\) и режем най-екстремните
-           **{int(RATIO_TRIM_Q*100)}% отдолу и отгоре**, за да не развалят средните.
-        4. Строим линейна зависимост:
-           \\( V = a \\cdot slope\\_% + b \\).
-        5. За всяка активност:
-           - намираме средна реална скорост на валидните сегменти,
-           - моделна скорост при същия наклон,
-           - суров коефициент на плъзгане \\(K_{{raw}} = V_{{real}}/V_{{model}}\\),
-           - регулиран коефициент \\(K_{{adj}}\\), който се доближава към 1
-             според избрания фактор,
-           - нормализирана средна скорост за цялата активност
-             \\( V_{{norm}} = V_{{overall}} / K_{{adj}} \\).
+        V = a · slope% + b  
+        a = **{a:.3f} km/h на 1% наклон**  
+        b = **{b:.3f} km/h при 0% наклон**
         """
     )
 
-    # Фактор за регулиране на влиянието – можеш да го пипаш по време на работа
-    factor = st.number_input(
-        "Фактор за приближаване на коефициента към 1 (0 = без влияние, 1 = пълно влияние)",
-        min_value=0.0,
-        max_value=1.0,
-        value=GLIDE_ADJUST_FACTOR_DEFAULT,
-        step=0.05,
+    # Резидуали = индикатор за плъзгаемост
+    down_trimmed = down_trimmed.copy()
+    down_trimmed["v_model"] = a * down_trimmed["slope_percent"] + b
+    down_trimmed["residual"] = down_trimmed["speed_kmh"] - down_trimmed["v_model"]
+    down_trimmed["glide_label"] = np.where(
+        down_trimmed["residual"] >= 0,
+        "По-добра плъзгаемост (V > модел)",
+        "По-лоша плъзгаемост (V < модел)",
     )
+
+    st.markdown("**Разпределение на скоростта спрямо наклона (downhill сегменти)**")
+
+    x_min = down_trimmed["slope_percent"].min()
+    x_max = down_trimmed["slope_percent"].max()
+    x_line = np.linspace(x_min, x_max, 100)
+    y_line = a * x_line + b
+    line_df = pd.DataFrame({"slope_percent": x_line, "v_model": y_line})
+
+    scatter = alt.Chart(down_trimmed).mark_circle(size=40, opacity=0.6).encode(
+        x=alt.X("slope_percent", title="Наклон (%)"),
+        y=alt.Y("speed_kmh", title="Скорост (km/h)"),
+        color=alt.Color("glide_label", title="Плъзгаемост"),
+        tooltip=["activity", "slope_percent", "speed_kmh", "v_model", "residual"],
+    )
+
+    line = alt.Chart(line_df).mark_line().encode(
+        x="slope_percent",
+        y="v_model",
+    )
+
+    st.altair_chart(scatter + line, use_container_width=True)
+
+
+# -----------------------
+# МОДЕЛ 2: ΔV% СПРЯМО РАВНОТО
+# -----------------------
+
+def fit_delta_v_model(slope: np.ndarray, delta_v_pct: np.ndarray):
+    """Квадратична регресия ΔV% = c2*s^2 + c1*s + c0."""
+    if len(slope) < 5:
+        return None
+    try:
+        coeffs = np.polyfit(slope, delta_v_pct, 2)
+        return coeffs  # [c2, c1, c0]
+    except Exception:
+        return None
+
+
+def show_slope_effect_model(all_segments: pd.DataFrame):
+    """Показва модел 2: влияние на наклона при еднакво усилие (ΔV%)."""
+    st.subheader("Модел 2: Влияние на наклона върху скоростта при еднакво усилие")
+
+    if all_segments.empty:
+        st.warning("Няма валидни сегменти за анализ.")
+        return
+
+    # 1) Референтна скорост V_flat при |slope| <= 1%
+    flat_mask = all_segments["slope_percent"].abs() <= FLAT_REF_SLOPE_MAX
+    flat_segments = all_segments[flat_mask]
+
+    if flat_segments.empty:
+        st.warning("Няма сегменти с |наклон| ≤ 1% за определяне на V_flat.")
+        return
+
+    v_flat = flat_segments["speed_kmh"].mean()
+    st.write(f"Референтна скорост на равното (|наклон| ≤ {FLAT_REF_SLOPE_MAX:.1f}%): "
+             f"**{v_flat:.2f} km/h**")
+
+    # 2) Сегменти за модела: -3% < slope < 10%, без равните
+    slope_mask = (
+        (all_segments["slope_percent"] > SLOPE_MODEL_MIN) &
+        (all_segments["slope_percent"] < SLOPE_MODEL_MAX) &
+        (~flat_mask) &
+        (all_segments["slope_percent"].abs() <= GLOBAL_SLOPE_LIMIT)
+    )
+    slope_df = all_segments[slope_mask].copy()
+
+    if slope_df.empty or len(slope_df) < 10:
+        st.warning("Недостатъчно сегменти в диапазона (-3%, +10%) за стабилен модел.")
+        return
+
+    slope_df["delta_v_pct"] = 100.0 * (slope_df["speed_kmh"] - v_flat) / v_flat
+
+    coeffs = fit_delta_v_model(
+        slope_df["slope_percent"].values,
+        slope_df["delta_v_pct"].values,
+    )
+
+    if coeffs is None:
+        st.warning("Не успях да построя квадратичен модел ΔV% = f(% наклон).")
+        return
+
+    c2, c1, c0 = coeffs
+
+    st.markdown(
+        f"""
+        **Модел за влияние на наклона (при еднакво усилие):**
+
+        ΔV% = c₂ · slope² + c₁ · slope + c₀  
+
+        c₂ = **{c2:.4f}**  
+        c₁ = **{c1:.4f}**  
+        c₀ = **{c0:.4f}**
+        """
+    )
+
+    # Визуализация: scatter + моделна линия
+    x_min = slope_df["slope_percent"].min()
+    x_max = slope_df["slope_percent"].max()
+    x_line = np.linspace(x_min, x_max, 200)
+    y_line = c2 * x_line**2 + c1 * x_line + c0
+    line_df = pd.DataFrame({"slope_percent": x_line, "delta_model": y_line})
+
+    scatter = alt.Chart(slope_df).mark_circle(size=40, opacity=0.5).encode(
+        x=alt.X("slope_percent", title="Наклон (%)"),
+        y=alt.Y("delta_v_pct", title="ΔV% спрямо равното"),
+        color=alt.Color("activity", title="Активност"),
+        tooltip=["activity", "slope_percent", "speed_kmh", "delta_v_pct"],
+    )
+
+    line = alt.Chart(line_df).mark_line().encode(
+        x="slope_percent",
+        y="delta_model",
+    )
+
+    st.altair_chart(scatter + line, use_container_width=True)
+
+
+# -----------------------
+# МОДЕЛ 3: CS ЗОНИ
+# -----------------------
+
+def assign_zone(speed_kmh: float, slope_percent: float, cs: float) -> str:
+    """
+    Връща име на зона според критичната скорост (CS).
+    - ако slope <= -3% -> натоварване в горната граница на Z1;
+    - иначе – според ratio = speed / CS.
+    """
+    if cs <= 0 or np.isnan(speed_kmh):
+        return "NA"
+
+    if slope_percent <= DOWNHILL_RELAX_SLOPE:
+        ratio = ZONES[0][1]  # горна граница на Z1
+    else:
+        ratio = speed_kmh / cs
+
+    for low, high, name in ZONES:
+        if low <= ratio < high:
+            return name
+    return ZONES[-1][2]
+
+
+def show_cs_zones_model(all_segments: pd.DataFrame):
+    """Показва модел 3: разпределение по зони спрямо критична скорост."""
+    st.subheader("Модел 3: Разпределение по зони спрямо критична скорост (CS)")
+
+    if all_segments.empty:
+        st.warning("Няма валидни сегменти за анализ.")
+        return
+
+    cs = st.number_input(
+        "Въведи критична скорост (km/h)",
+        min_value=0.0,
+        value=0.0,
+        step=0.1,
+    )
+
+    if cs <= 0:
+        st.info("Моля, въведи критична скорост, за да видиш зоновете.")
+        return
+
+    seg_zones = all_segments.copy()
+    seg_zones["zone"] = seg_zones.apply(
+        lambda row: assign_zone(row["speed_kmh"], row["slope_percent"], cs),
+        axis=1,
+    )
+
+    total_time = seg_zones["duration_s"].sum()
+    if total_time <= 0:
+        st.warning("Общото време на сегментите е нула – не мога да направя разпределение.")
+        return
+
+    zone_stats = []
+    for low, high, name in ZONES:
+        z = seg_zones[seg_zones["zone"] == name]
+        if z.empty:
+            zone_stats.append(
+                {
+                    "zone": name,
+                    "time_min": 0.0,
+                    "time_pct": 0.0,
+                    "mean_speed_kmh": np.nan,
+                }
+            )
+        else:
+            time_s = z["duration_s"].sum()
+            time_min = time_s / 60.0
+            time_pct = 100.0 * time_s / total_time
+            mean_speed = np.average(z["speed_kmh"], weights=z["duration_s"])
+            zone_stats.append(
+                {
+                    "zone": name,
+                    "time_min": time_min,
+                    "time_pct": time_pct,
+                    "mean_speed_kmh": mean_speed,
+                }
+            )
+
+    zone_df = pd.DataFrame(zone_stats)
+
+    st.markdown(
+        f"""
+        Сегментите с **наклон ≤ {DOWNHILL_RELAX_SLOPE:.1f}%** се отчитат като натоварване
+        в **горната граница на Z1**, независимо от реалната скорост.  
+        Останалите сегменти се разпределят по зони спрямо съотношението V / CS.
+        """
+    )
+
+    st.dataframe(
+        zone_df.style.format(
+            {
+                "time_min": "{:.1f}",
+                "time_pct": "{:.1f}",
+                "mean_speed_kmh": "{:.2f}",
+            }
+        )
+    )
+
+
+# -----------------------
+# MAIN APP
+# -----------------------
+
+def main():
+    # Sidebar – избор на модел
+    st.sidebar.title("Избор на модел")
+    mode = st.sidebar.radio(
+        "Модел:",
+        (
+            "Ski Glide Dynamics (V=f(% наклон))",
+            "Влияние на наклона (ΔV% спрямо равното)",
+            "CS Зони (разпределение по критична скорост)",
+        ),
+    )
+
+    st.title("onFlows – Ski Glide Dynamics & Slope Models")
 
     uploaded_files = st.file_uploader(
         "Качи един или повече TCX файла",
@@ -321,135 +515,51 @@ def main():
     )
 
     if not uploaded_files:
-        st.info("Моля, качи поне един TCX файл.")
+        st.info("Качи TCX файлове, за да започнем анализа.")
         return
 
-    all_valid_segments = []
-    raw_by_activity = {}
+    # Събиране на сегментите от всички файлове
+    all_segments_list = []
+    downhill_segments_list = []
 
-    # 1) Парсване и първичен филтър
     for file in uploaded_files:
-        st.subheader(f"Активност: {file.name}")
-
         df_raw = parse_tcx(file)
         if df_raw.empty:
-            st.warning("Не бяха намерени валидни Trackpoint-и в TCX.")
             continue
-
-        raw_by_activity[file.name] = df_raw
 
         seg_df = build_segments(df_raw)
         if seg_df.empty:
-            st.warning("Неуспешно създаване на сегменти (твърде малко данни).")
             continue
 
-        seg_valid = filter_segments_with_predecessor(seg_df)
+        seg_df["activity"] = file.name
+        all_segments_list.append(seg_df)
 
-        st.write(f"Общо сегменти: {len(seg_df)}, валидни (наклон + предходен): {len(seg_valid)}")
+        # за Ski Glide модела – downhill сегменти
+        seg_down = filter_downhill_with_predecessor(seg_df)
+        if not seg_down.empty:
+            seg_down["activity"] = file.name
+            downhill_segments_list.append(seg_down)
 
-        if not seg_valid.empty:
-            seg_valid = seg_valid.assign(activity=file.name)
-            all_valid_segments.append(seg_valid)
-            st.dataframe(
-                seg_valid[["seg_id", "slope_percent", "speed_kmh", "horiz_dist_m"]].head()
-            )
-
-    if not all_valid_segments:
-        st.error("Няма нито един валиден сегмент, който да отговаря на критериите.")
+    if not all_segments_list:
+        st.error("Не успях да извлека валидни сегменти от нито един файл.")
         return
 
-    all_valid_segments = pd.concat(all_valid_segments, ignore_index=True)
+    all_segments = pd.concat(all_segments_list, ignore_index=True)
 
-    # 2) Филтър по отношение скорост/|наклон|
-    st.markdown("### Филтър по отношение скорост / |наклон|")
-    before_n = len(all_valid_segments)
-    all_valid_segments, r_low, r_high = filter_by_speed_slope_ratio(all_valid_segments)
+    # Филтър за екстремни наклони за общ анализ (за ΔV% и частично за CS)
+    all_segments = all_segments[
+        all_segments["slope_percent"].abs() <= GLOBAL_SLOPE_LIMIT
+    ].copy()
 
-    if r_low is not None:
-        after_n = len(all_valid_segments)
-        st.write(
-            f"Сегменти преди филтъра: **{before_n}**, "
-            f"след филтъра: **{after_n}**"
-        )
-        st.write(
-            f"Допускаме сегменти с V/|slope| между "
-            f"**{r_low:.2f}** и **{r_high:.2f}** km/h на 1% наклон."
-        )
-    else:
-        st.write("Твърде малко сегменти – не е прилаган допълнителен филтър по V/|slope|.")
+    # Избор на модел
+    if mode.startswith("Ski Glide Dynamics"):
+        show_ski_glide_model(downhill_segments_list)
 
-    st.markdown("### Обединени валидни сегменти (след всички филтри)")
-    st.dataframe(
-        all_valid_segments[
-            ["activity", "seg_id", "slope_percent", "speed_kmh", "horiz_dist_m"]
-        ].head(200)
-    )
+    elif mode.startswith("Влияние на наклона"):
+        show_slope_effect_model(all_segments)
 
-    # 3) Модел V = f(slope)
-    a, b = fit_speed_vs_slope_model(all_valid_segments)
-    if a is None or b is None:
-        st.error("Неуспех при построяване на модел V = f(наклон). Няма достатъчно данни.")
-        return
-
-    st.markdown("### Модел V = f(% наклон)")
-    st.write("Форма: **V = a * slope_percent + b**")
-    st.write(f"**a = {a:.4f} (km/h на 1% наклон)**")
-    st.write(f"**b = {b:.4f} (km/h при 0% наклон по модела)**")
-
-    # 4) Обобщение по активности
-    summaries = []
-    for name, df_raw in raw_by_activity.items():
-        seg_act = all_valid_segments[all_valid_segments["activity"] == name].copy()
-        seg_act = seg_act.drop(columns=["activity"]) if not seg_act.empty else seg_act
-        summary = compute_activity_summary(name, df_raw, seg_act, a, b, factor)
-        if summary is not None:
-            summaries.append(summary)
-
-    if not summaries:
-        st.error("Не успях да изчисля обобщение за нито една активност.")
-        return
-
-    summary_df = pd.DataFrame(summaries)
-    summary_df = summary_df[
-        [
-            "activity",
-            "n_segments",
-            "mean_slope_valid",
-            "mean_speed_valid",
-            "model_speed_at_mean_slope",
-            "glide_coeff_raw",
-            "glide_coeff_adj",
-            "overall_speed",
-            "normalized_overall_speed",
-        ]
-    ]
-
-    st.markdown("## Обобщение по активности")
-    st.markdown(
-        """
-        - **glide_coeff_raw** – суров коефициент на плъзгане \\(K_{raw} = V_{real}/V_{model}\\).
-        - **glide_coeff_adj** – регулиран коефициент, придърпан към 1 с избрания фактор.
-        - **normalized_overall_speed** – средна скорост на цялата активност,
-          приравнена към референтна плъзгаемост (използва K_adj).
-        """
-    )
-
-    st.dataframe(summary_df.style.format(
-        {
-            "mean_slope_valid": "{:.2f}",
-            "mean_speed_valid": "{:.2f}",
-            "model_speed_at_mean_slope": "{:.2f}",
-            "glide_coeff_raw": "{:.3f}",
-            "glide_coeff_adj": "{:.3f}",
-            "overall_speed": "{:.2f}",
-            "normalized_overall_speed": "{:.2f}",
-        }
-    ))
-
-    # 5) Scatter V vs slope
-    st.markdown("### Разпределение на скоростта спрямо наклона (валидни сегменти)")
-    chart_df = all_valid_segments[["slope_percent", "speed_kmh"]]
-    st.scatter_chart(chart_df, x="slope_percent", y="speed_kmh")
+    elif mode.startswith("CS Зони"):
+        show_cs_zones_model(all_segments)
 
 
 if __name__ == "__main__":
