@@ -10,12 +10,10 @@ import plotly.express as px
 # НАСТРОЙКИ НА МОДЕЛА
 # ------------------------
 
-SEGMENT_LENGTH_SEC = 10.0        # дължина на сегмента (в сек)
-MIN_SEGMENT_DURATION_SEC = 8.0   # минимална реална продължителност
+SEGMENT_LENGTH_SEC = 5.0         # дължина на сегмента (в сек)
+MIN_SEGMENT_DURATION_SEC = 4.0   # минимална реална продължителност
 MIN_SEGMENT_DISTANCE_M = 5.0     # минимална хоризонтална дистанция (за да няма деление на 0)
 MIN_SLOPE_PERCENT = -5.0         # търсим сегменти със среден наклон < -5%
-MAX_ALT_JUMP_PER_SEC = 1.0       # макс. позволен скок по височина (м/сек)
-MAX_SPEED_JUMP_PER_SEC = 2.0     # макс. позволен скок по скорост (км/ч за 1 сек)
 
 
 # ------------------------
@@ -25,14 +23,15 @@ MAX_SPEED_JUMP_PER_SEC = 2.0     # макс. позволен скок по ск
 def parse_tcx(file) -> pd.DataFrame:
     """
     Парсва TCX файл и връща DataFrame с:
-    time, altitude_m, distance_m
-    и изчислени dt, speed_kmh, d_alt, d_speed, valid.
+    time, altitude_m, distance_m, dt, speed_kmh, d_alt, d_speed.
+
+    ВАЖНО: тук НЕ ФИЛТРИРАМЕ артефакти – работим със суровите данни,
+    само осигуряваме смислени dt и скорост (за да избегнем деление на 0).
     """
     content = file.read()
     tree = ET.parse(BytesIO(content))
     root = tree.getroot()
 
-    # Взимаме всички Trackpoint, без да се занимаваме с namespace-ите
     trackpoints = root.findall(".//{*}Trackpoint")
 
     records = []
@@ -80,58 +79,37 @@ def parse_tcx(file) -> pd.DataFrame:
     df["dt"] = df["time"].diff().dt.total_seconds()
     df.loc[0, "dt"] = np.nan
 
-    # Правим разлика в дистанцията
+    # Дистанцията я правим монотонна чрез ffill (TCX обикновено е кумулативна)
     df["distance_m"] = df["distance_m"].ffill()
+
+    # Разлики по дистанция и скорост
     df["d_dist"] = df["distance_m"].diff()
 
-    # Нереалистично обратно движение -> маскираме
-    df.loc[df["d_dist"] < 0, "d_dist"] = np.nan
-
-    # Скорост (km/h) на база d_dist и dt
+    # Скорост (km/h) на база d_dist и dt – без филтър за „скокове“
     df["speed_kmh"] = (df["d_dist"] / df["dt"]) * 3.6
 
-    # Разлики по височина и скорост
+    # Разлики по височина и скорост (сурови)
     df["d_alt"] = df["altitude_m"].diff()
     df["d_speed"] = df["speed_kmh"].diff()
-
-    # Флаг за валидност
-    df["valid"] = True
-
-    # Невалидно време (dt <= 0 или много голямо) -> invalid
-    df.loc[(df["dt"] <= 0) | (df["dt"].isna()), "valid"] = False
-
-    # Филтър за артефакти по денивелация:
-    # ако |Δalt| > MAX_ALT_JUMP_PER_SEC * dt  -> invalid
-    mask_bad_alt = (
-        (df["dt"] > 0)
-        & (df["d_alt"].abs() > MAX_ALT_JUMP_PER_SEC * df["dt"])
-    )
-
-    # Филтър за артефакти по скорост:
-    # ако |ΔV| > MAX_SPEED_JUMP_PER_SEC * dt -> invalid
-    mask_bad_speed = (
-        (df["dt"] > 0)
-        & (df["d_speed"].abs() > MAX_SPEED_JUMP_PER_SEC * df["dt"])
-    )
-
-    df.loc[mask_bad_alt | mask_bad_speed, "valid"] = False
 
     return df
 
 
 def extract_segments(df: pd.DataFrame, seg_length_sec: float = SEGMENT_LENGTH_SEC) -> pd.DataFrame:
     """
-    Разделя активността на 10-секундни сегменти и връща
+    Разделя активността на 5-секундни сегменти и връща
     само тези, които:
     - имат среден наклон < MIN_SLOPE_PERCENT;
-    - предходният сегмент също има среден наклон < MIN_SLOPE_PERCENT;
-    - височината вътре в сегмента е само намаляваща (мон. не-нарастваща);
-    - всички точки са "valid".
+    - предходният 5-сек сегмент също има среден наклон < MIN_SLOPE_PERCENT;
+    - височината вътре в сегмента е само намаляваща (мон. не-нарастваща).
+
+    Работи директно със суровите данни (без филтри за артефакти),
+    но премахва очевидно невалидни редове: без dt, без distance, без speed.
     """
 
-    # Взимаме само валидните точки
-    df = df[df["valid"]].copy()
-    df = df.dropna(subset=["time", "altitude_m", "distance_m", "speed_kmh"])
+    # Премахваме редове с липсващи ключови данни или невалидно dt
+    df = df.dropna(subset=["time", "altitude_m", "distance_m", "speed_kmh", "dt"]).copy()
+    df = df[df["dt"] > 0].copy()
     df = df.sort_values("time").reset_index(drop=True)
 
     if len(df) < 2:
@@ -165,13 +143,12 @@ def extract_segments(df: pd.DataFrame, seg_length_sec: float = SEGMENT_LENGTH_SE
         if seg_dist <= MIN_SEGMENT_DISTANCE_M:
             continue
 
-        # Проверка за строго спускане: височината не трябва да нараства никъде
+        # Проверка за строго спускане: височината НЕ трябва да нараства никъде
         alt_values = g["altitude_m"].values
         if np.any(np.diff(alt_values) > 0):
-            # има поне една стъпка, където височината се е качила
             continue
 
-        # Изчисляваме средна скорост (по сегмент)
+        # Средна скорост по сегмент
         mean_speed = (seg_dist / duration) * 3.6
 
         alt_start = alt_values[0]
@@ -211,10 +188,10 @@ def extract_segments(df: pd.DataFrame, seg_length_sec: float = SEGMENT_LENGTH_SE
     # Маркираме "надолу" сегментите
     seg_df["downhill"] = seg_df["mean_slope_percent"] < MIN_SLOPE_PERCENT
 
-    # Предходен сегмент с наклон < -5%
+    # Предходен 5-сек сегмент с наклон < -5%
     seg_df["prev_downhill"] = seg_df["downhill"].shift(1).fillna(False)
 
-    # Тук вече прилагаме критерия:
+    # Критерий:
     # - сегментът да е downhill
     # - предходният също да е downhill
     seg_df = seg_df[seg_df["downhill"] & seg_df["prev_downhill"]].copy()
@@ -222,8 +199,7 @@ def extract_segments(df: pd.DataFrame, seg_length_sec: float = SEGMENT_LENGTH_SE
     if seg_df.empty:
         return seg_df
 
-    # ΔV / наклон% (използваме абсолютната стойност на наклона,
-    # за да имаме по-интуитивен положителен коефициент)
+    # ΔV / наклон% (ползваме абсолютната стойност на наклона за по-интуитивен положителен коефициент)
     seg_df["dv_per_slope_abs"] = seg_df["delta_v_kmh"] / seg_df["mean_slope_percent"].abs()
     seg_df["dv_per_slope_signed"] = seg_df["delta_v_kmh"] / seg_df["mean_slope_percent"]
 
@@ -242,7 +218,6 @@ def fit_criterion_model(segments: pd.DataFrame):
     if segments.shape[0] < 3:
         return segments, None
 
-    # Подготвяме матрицата за линейна регресия
     X = np.column_stack(
         [
             np.ones(len(segments)),
@@ -272,23 +247,24 @@ def fit_criterion_model(segments: pd.DataFrame):
 # STREAMLIT UI
 # ------------------------
 
-st.title("Ski Glide Dynamics – нов модел")
+st.title("Ski Glide Dynamics – сурови данни, 5-сек сегменти")
 
 st.markdown(
     """
-Моделът:
-1. **Чисти артефакти** от суровите данни (денивелация и скорост).
-2. **Реже** цялата активност на 10-секундни сегменти.
+Моделът (нова версия):
+
+1. Работи **директно със суровите данни** от TCX (без филтри за артефакти, без тренд линия).
+2. **Реже** цялата активност на **5-секундни** сегменти.
 3. Избира само сегменти, които:
    - са **спускане** със среден наклон под -5%;
-   - са **предхождани** от друг спускащ сегмент (< -5%);
-   - имат **само намаляващи стойности на височината** (чисто спускане).
-4. От всички валидни сегменти (от всички активности) изчислява:
+   - са **предхождани от друг 5-сек сегмент** със среден наклон под -5%;
+   - имат **само намаляващи стойности на височината** (мон. не-нарастващи).
+4. За всички валидни сегменти (от всички активности) изчислява:
    - средна скорост,
    - среден наклон,
    - ΔV (крайна - начална скорост),
    - ΔV / наклон%,
-   - и прост **критериен фактор** за „плъзгаемост“.
+   - и прост **критериен фактор** за плъзгаемост.
 """
 )
 
@@ -343,7 +319,11 @@ if uploaded_files:
             ]
         )
 
-        # Обобщени средни стойности за всички сегменти (глобално)
+        # Фитваме критериен модел ПРЕДИ обобщенията по файл,
+        # за да имаме criterion_factor в summary_by_file.
+        segments, coeffs = fit_criterion_model(segments)
+
+        # Глобални средни стойности
         st.subheader("Глобални средни стойности на преминалите сегменти (всички файлове)")
         mean_speed = segments["mean_speed_kmh"].mean()
         mean_slope = segments["mean_slope_percent"].mean()
@@ -358,7 +338,7 @@ if uploaded_files:
             st.metric("Среден наклон (%)", f"{mean_slope:.2f}")
             st.metric("Средно ΔV / |наклон|", f"{mean_dv_per_slope:.4f}")
 
-        # --- НОВО: Обобщителна таблица по активност (файл) ---
+        # Обобщителна таблица по активност (файл)
         st.subheader("Обобщителна таблица по активност (по файл)")
 
         agg_dict = {
@@ -390,9 +370,7 @@ if uploaded_files:
 
         st.dataframe(summary_by_file)
 
-        # Фитваме критериен модел
-        segments, coeffs = fit_criterion_model(segments)
-
+        # Ако има критериен модел – показваме параметрите и разпределението
         if coeffs is not None:
             st.subheader("Критериен модел за ΔV/наклон%")
             st.markdown(
@@ -421,7 +399,16 @@ b_0 + b_{{speed}} \\cdot V_{{mean}} + b_{{slope}} \\cdot slope
 
             st.subheader("Разпределение на критериения фактор")
             st.write(
-                segments[["file_name", "seg_idx", "mean_speed_kmh", "mean_slope_percent", "dv_per_slope_abs", "criterion_factor"]]
+                segments[
+                    [
+                        "file_name",
+                        "seg_idx",
+                        "mean_speed_kmh",
+                        "mean_slope_percent",
+                        "dv_per_slope_abs",
+                        "criterion_factor",
+                    ]
+                ]
             )
 
         # 3D визуализация
@@ -448,7 +435,7 @@ b_0 + b_{{speed}} \\cdot V_{{mean}} + b_{{slope}} \\cdot slope
         st.download_button(
             label="Свали всички сегменти като CSV",
             data=csv_bytes,
-            file_name="ski_glide_segments.csv",
+            file_name="ski_glide_segments_raw_5s.csv",
             mime="text/csv",
         )
 else:
