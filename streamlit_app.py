@@ -246,6 +246,13 @@ def segment_activity(df: pd.DataFrame, activity_id: int) -> pd.DataFrame:
 # =========================
 
 def build_glide_model(segments: pd.DataFrame, alpha_glide: float) -> Tuple[pd.DataFrame, Dict]:
+    """
+    Модел за плъзгаемост:
+    - използваме ВСИЧКИ downhill сегменти с инерция (предхождащ също downhill),
+      минали общите филтри;
+    - без outlier филтър по R = V / slope;
+    - връщаме и train_df, за да можем да видим среден наклон/скорост по активности.
+    """
     seg = segments.copy()
     if seg.empty:
         return seg, {
@@ -253,50 +260,43 @@ def build_glide_model(segments: pd.DataFrame, alpha_glide: float) -> Tuple[pd.Da
             "b": 0.0,
             "used_segments": 0,
             "glide_indices": {},
+            "train_df": pd.DataFrame(),
             "scatter_df": pd.DataFrame(),
         }
 
+    # Downhill диапазон
     downhill_mask = (seg["slope_pct"] >= GLIDE_SLOPE_MIN) & (seg["slope_pct"] <= GLIDE_SLOPE_MAX)
     seg["downhill"] = downhill_mask
 
+    # Инерция – предишният сегмент също downhill
     seg = seg.sort_values(["activity_id", "seg_id"]).reset_index(drop=True)
     prev_downhill = seg.groupby("activity_id")["downhill"].shift(1).fillna(False)
     seg["downhill_inertia"] = seg["downhill"] & prev_downhill
 
+    # Тренировъчни сегменти за модела
     D = seg[seg["downhill_inertia"]].copy()
-    if D.empty:
+
+    if D.empty or len(D) < MIN_SEG_GLIDE_MODEL:
+        # няма достатъчно материал за стабилен модел
         seg["v_glide_kmh"] = seg["v_mean_kmh"]
         return seg, {
             "a": 0.0,
             "b": 0.0,
-            "used_segments": 0,
+            "used_segments": int(len(D)),
             "glide_indices": {aid: 1.0 for aid in seg["activity_id"].unique()},
-            "scatter_df": pd.DataFrame(),
+            "train_df": D[["activity_id", "dur_s", "slope_pct", "v_mean_kmh"]].copy(),
+            "scatter_df": D[["slope_pct", "v_mean_kmh"]].copy(),
         }
 
-    D["R"] = D["v_mean_kmh"] / D["slope_pct"]
-    R_q05 = D["R"].quantile(0.05)
-    R_q95 = D["R"].quantile(0.95)
-    D_star = D[(D["R"] >= R_q05) & (D["R"] <= R_q95)].copy()
-
-    if len(D_star) < MIN_SEG_GLIDE_MODEL:
-        seg["v_glide_kmh"] = seg["v_mean_kmh"]
-        return seg, {
-            "a": 0.0,
-            "b": 0.0,
-            "used_segments": len(D_star),
-            "glide_indices": {aid: 1.0 for aid in seg["activity_id"].unique()},
-            "scatter_df": D_star[["slope_pct", "v_mean_kmh"]],
-        }
-
-    x = D_star["slope_pct"].values
-    y = D_star["v_mean_kmh"].values
+    # Линейна регресия V = a*slope + b върху ВСИЧКИ D
+    x = D["slope_pct"].values
+    y = D["v_mean_kmh"].values
     A = np.vstack([x, np.ones_like(x)]).T
     a, b = np.linalg.lstsq(A, y, rcond=None)[0]
 
     glide_indices = {}
     for aid in seg["activity_id"].unique():
-        D_A = D_star[D_star["activity_id"] == aid]
+        D_A = D[D["activity_id"] == aid]
         if D_A.empty:
             glide_indices[aid] = 1.0
             continue
@@ -311,11 +311,9 @@ def build_glide_model(segments: pd.DataFrame, alpha_glide: float) -> Tuple[pd.Da
             continue
 
         K_raw = V_real / V_model
-        if (K_raw < 0.5) or (K_raw > 1.5):
-            glide_indices[aid] = 1.0
-        else:
-            K_soft = 1.0 + alpha_glide * (K_raw - 1.0)
-            glide_indices[aid] = K_soft
+        # омекотяване около 1.0
+        K_soft = 1.0 + alpha_glide * (K_raw - 1.0)
+        glide_indices[aid] = K_soft
 
     seg["K_glide_soft"] = seg["activity_id"].map(glide_indices)
     seg["v_glide_kmh"] = seg["v_mean_kmh"] / seg["K_glide_soft"].replace(0, 1.0)
@@ -323,46 +321,65 @@ def build_glide_model(segments: pd.DataFrame, alpha_glide: float) -> Tuple[pd.Da
     model_info = {
         "a": float(a),
         "b": float(b),
-        "used_segments": int(len(D_star)),
+        "used_segments": int(len(D)),
         "glide_indices": glide_indices,
-        "scatter_df": D_star[["slope_pct", "v_mean_kmh"]].copy(),
+        # ще ги ползваме за таблица и графики
+        "train_df": D[["activity_id", "dur_s", "slope_pct", "v_mean_kmh"]].copy(),
+        "scatter_df": D[["slope_pct", "v_mean_kmh"]].copy(),
     }
 
     return seg, model_info
-
 
 # =========================
 # МОДЕЛ 2 – ΔV% И НАКЛОН
 # =========================
 
 def build_slope_model(seg: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
+    """
+    Модел ΔV% спрямо наклон:
+    - обучаваме от ВСИЧКИ сегменти с наклон >= -3%;
+    - без отделно изключване на „равни“ сегменти (те просто дават ΔV≈0);
+    - пак използваме V_flat като референтна скорост.
+    """
     df = seg.copy()
     if df.empty or "v_glide_kmh" not in df.columns:
         df["v_final_kmh"] = df.get("v_glide_kmh", df.get("v_mean_kmh", 0.0))
-        return df, {"V_flat": None, "c0": 0.0, "c1": 0.0, "c2": 0.0,
-                    "used_segments": 0, "scatter_df": pd.DataFrame()}
+        return df, {
+            "V_flat": None,
+            "c0": 0.0,
+            "c1": 0.0,
+            "c2": 0.0,
+            "used_segments": 0,
+            "train_df": pd.DataFrame(),
+            "scatter_df": pd.DataFrame(),
+        }
 
+    # Равна скорост
     flat = df[df["slope_pct"].abs() <= FLAT_SLOPE_ABS_MAX]
     if flat["dur_s"].sum() >= 180:
         V_flat = np.average(flat["v_glide_kmh"], weights=flat["dur_s"])
     else:
         V_flat = np.average(df["v_glide_kmh"], weights=df["dur_s"])
 
-    cond_range = (df["slope_pct"] > DV_SLOPE_MIN) & (df["slope_pct"] < DV_SLOPE_MAX)
-    cond_not_flat = df["slope_pct"].abs() > DV_EXCLUDE_FLAT_ABS
-    S = df[cond_range & cond_not_flat].copy()
+    # Всички сегменти с наклон >= -3%
+    S = df[df["slope_pct"] >= -3.0].copy()
 
     if len(S) < MIN_SEG_DV_MODEL or V_flat <= 0:
         df["v_final_kmh"] = df["v_glide_kmh"]
         return df, {
             "V_flat": V_flat,
-            "c0": 0.0, "c1": 0.0, "c2": 0.0,
+            "c0": 0.0,
+            "c1": 0.0,
+            "c2": 0.0,
             "used_segments": len(S),
+            "train_df": S[["slope_pct"]].copy(),
             "scatter_df": S[["slope_pct"]].copy(),
         }
 
+    # ΔV_real%
     S["dV_real_pct"] = (S["v_glide_kmh"] - V_flat) / V_flat * 100.0
 
+    # Квадратична регресия ΔV% = c0 + c1*slope + c2*slope^2
     x = S["slope_pct"].values
     X = np.vstack([np.ones_like(x), x, x ** 2]).T
     y = S["dV_real_pct"].values
@@ -372,6 +389,7 @@ def build_slope_model(seg: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
     df["dV_model_pct"] = c0 + c1 * df["slope_pct"] + c2 * (df["slope_pct"] ** 2)
     denom = 1.0 + df["dV_model_pct"] / 100.0
     denom = denom.replace(0, np.nan)
+
     df["v_final_kmh"] = df["v_glide_kmh"] / denom
     df["v_final_kmh"] = df["v_final_kmh"].replace([np.inf, -np.inf], np.nan).fillna(df["v_glide_kmh"])
 
@@ -381,6 +399,7 @@ def build_slope_model(seg: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
         "c1": float(c1),
         "c2": float(c2),
         "used_segments": int(len(S)),
+        "train_df": S[["slope_pct", "dV_real_pct"]].copy(),
         "scatter_df": S[["slope_pct", "dV_real_pct"]].copy(),
     }
 
