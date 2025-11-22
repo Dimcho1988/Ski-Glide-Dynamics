@@ -229,7 +229,7 @@ def compute_glide_model(downhill_segments_list, raw_by_activity):
     - glide_index по активност
     """
     if not downhill_segments_list:
-        return {}, None, None, pd.DataFrame()
+        return {}, None, None, pd.DataFrame(), pd.DataFrame()
 
     down = pd.concat(downhill_segments_list, ignore_index=True)
 
@@ -239,7 +239,7 @@ def compute_glide_model(downhill_segments_list, raw_by_activity):
     # модел
     a, b = fit_linear_speed_slope(down_trimmed)
     if a is None:
-        return {}, None, None, pd.DataFrame()
+        return {}, None, None, pd.DataFrame(), pd.DataFrame()
 
     # обобщение по активности
     glide_index_by_activity = {}
@@ -374,7 +374,6 @@ def compute_glide_corrected_segments(all_segments: pd.DataFrame, glide_index_by_
     """Добавя колоната speed_glide_kmh – реална скорост, коригирана по плъзгаемост."""
     seg = all_segments.copy()
     glide_idx = glide_index_by_activity or {}
-    # по подразбиране – няма корекция (K=1)
     ks = [glide_idx.get(act, 1.0) for act in seg["activity"]]
     seg["glide_index"] = ks
     seg["speed_glide_kmh"] = np.where(
@@ -437,6 +436,7 @@ def apply_slope_correction(all_segments_glide: pd.DataFrame, v_flat, coeffs):
 
     if v_flat is not None and coeffs is not None:
         c2, c1, c0 = coeffs
+
         def slope_factor(s):
             if abs(s) <= FLAT_REF_SLOPE_MAX:
                 return 1.0
@@ -447,13 +447,9 @@ def apply_slope_correction(all_segments_glide: pd.DataFrame, v_flat, coeffs):
 
         seg["slope_factor"] = seg["slope_percent"].apply(slope_factor)
 
-    # избягваме делене на нула
     f = seg["slope_factor"].replace(0, 1.0)
 
-    # само наклонова корекция (без плъзгаемост) – за информация
     seg["speed_slope_kmh"] = seg["speed_kmh"] / f
-
-    # финална коригирана скорост (плъзгаемост + наклон)
     seg["speed_flat_kmh"] = seg["speed_glide_kmh"] / f
 
     return seg
@@ -486,7 +482,6 @@ def show_slope_effect_view(v_flat, coeffs, all_corr: pd.DataFrame):
         """
     )
 
-    # Сегментите, използвани за модела
     flat_mask = all_corr["slope_percent"].abs() <= FLAT_REF_SLOPE_MAX
     slope_mask = (
         (all_corr["slope_percent"] > SLOPE_MODEL_MIN) &
@@ -501,7 +496,6 @@ def show_slope_effect_view(v_flat, coeffs, all_corr: pd.DataFrame):
     slope_df["delta_real_pct"] = 100.0 * (slope_df["speed_glide_kmh"] - v_flat) / v_flat
     slope_df["delta_model_pct"] = c2 * slope_df["slope_percent"]**2 + c1 * slope_df["slope_percent"] + c0
 
-    # scatter + моделна линия
     x_min = slope_df["slope_percent"].min()
     x_max = slope_df["slope_percent"].max()
     x_line = np.linspace(x_min, x_max, 200)
@@ -530,7 +524,6 @@ def show_slope_effect_view(v_flat, coeffs, all_corr: pd.DataFrame):
 
     st.altair_chart(scatter + line, use_container_width=True)
 
-    # Обобщителна таблица по активности
     st.markdown("**Обобщение по активности (реална и модулирана скорост)**")
 
     per_act = []
@@ -578,31 +571,12 @@ def show_slope_effect_view(v_flat, coeffs, all_corr: pd.DataFrame):
 # МОДЕЛ 3: CS ЗОНИ (с двойно модулирана скорост)
 # -----------------------
 
-def assign_zone(speed_eff_kmh: float, slope_percent: float, cs: float) -> str:
-    """
-    Зониране по критична скорост (CS), използвайки финално коригираната скорост.
-    - ако slope <= -3% -> натоварване в горната граница на Z1;
-    - иначе – според ratio = speed_eff / CS.
-    """
-    if cs <= 0 or np.isnan(speed_eff_kmh):
-        return "NA"
-
-    if slope_percent <= DOWNHILL_RELAX_SLOPE:
-        ratio = ZONES[0][1]  # горна граница на Z1
-    else:
-        ratio = speed_eff_kmh / cs
-
-    for low, high, name in ZONES:
-        if low <= ratio < high:
-            return name
-    return ZONES[-1][2]
-
-
 def show_cs_zones_view(all_corr: pd.DataFrame):
     """
     Модел 3: разпределение по зони спрямо CS.
-    Използва финално коригираната скорост speed_flat_kmh
-    (след плъзгаемост и наклон).
+    Използва финално коригираната скорост speed_flat_kmh,
+    но за сегменти със slope <= DOWNHILL_RELAX_SLOPE ги приравнява
+    към горната граница на зона 1 (eff_speed = 0.8 * CS).
     """
     st.subheader("Модел 3: Разпределение по зони спрямо критична скорост (CS)")
 
@@ -622,10 +596,26 @@ def show_cs_zones_view(all_corr: pd.DataFrame):
         return
 
     seg = all_corr.copy()
-    seg["zone"] = seg.apply(
-        lambda row: assign_zone(row["speed_flat_kmh"], row["slope_percent"], cs),
-        axis=1,
-    )
+
+    # Ефективна скорост за зониране (двойно модулирана):
+    seg["eff_speed_kmh"] = seg["speed_flat_kmh"]
+
+    # Спусканията <= -3% се броят като натоварване в горната граница на Z1
+    upper_z1_ratio = ZONES[0][1]  # напр. 0.80
+    seg.loc[seg["slope_percent"] <= DOWNHILL_RELAX_SLOPE, "eff_speed_kmh"] = cs * upper_z1_ratio
+
+    # ratio = eff_speed / CS
+    seg["ratio"] = seg["eff_speed_kmh"] / cs
+
+    def zone_from_ratio(r):
+        if np.isnan(r):
+            return "NA"
+        for low, high, name in ZONES:
+            if low <= r < high:
+                return name
+        return ZONES[-1][2]
+
+    seg["zone"] = seg["ratio"].apply(zone_from_ratio)
 
     total_time = seg["duration_s"].sum()
     if total_time <= 0:
@@ -649,7 +639,7 @@ def show_cs_zones_view(all_corr: pd.DataFrame):
             t_s = z["duration_s"].sum()
             t_min = t_s / 60.0
             t_pct = 100.0 * t_s / total_time
-            mean_speed = np.average(z["speed_flat_kmh"], weights=z["duration_s"])
+            mean_speed = np.average(z["eff_speed_kmh"], weights=z["duration_s"])
             zone_stats.append(
                 {
                     "zone": name,
@@ -665,7 +655,9 @@ def show_cs_zones_view(all_corr: pd.DataFrame):
         1) коригирана за плъзгаемост (ски, сняг),  
         2) коригирана за наклон (ΔV% модел).  
 
-        Колона `mean_speed_mod_kmh` е финалната ефективна скорост върху „равен“ терен.
+        При спускания (наклон ≤ −3%) ефективната скорост за зонирането
+        се фиксира до горната граница на зона 1 (0.8 · CS), за да се отчете
+        статичното натоварване без допълнително „помпане“.
         """
     )
 
@@ -702,7 +694,7 @@ def show_cs_zones_view(all_corr: pd.DataFrame):
                 t_s = z["duration_s"].sum()
                 t_min = t_s / 60.0
                 t_pct = 100.0 * t_s / total_t_act if total_t_act > 0 else 0.0
-                mean_speed = np.average(z["speed_flat_kmh"], weights=z["duration_s"])
+                mean_speed = np.average(z["eff_speed_kmh"], weights=z["duration_s"])
                 per_act_rows.append(
                     {
                         "activity": act_name,
@@ -786,7 +778,7 @@ def main():
         all_segments["slope_percent"].abs() <= GLOBAL_SLOPE_LIMIT
     ].copy()
 
-    # 1) Модел за плъзгаемост – винаги го изчисляваме (нужен е и на другите модели)
+    # 1) Модел за плъзгаемост
     glide_index_by_activity, a, b, down_trimmed, glide_summary_df = compute_glide_model(
         downhill_segments_list, raw_by_activity
     )
