@@ -345,8 +345,10 @@ def show_ski_glide_view(a, b, down_trimmed, summary_df):
 
     st.altair_chart(scatter + line, use_container_width=True)
 
-    st.markdown("**Обобщение по активности**")  
-    (downhill показатели + реална и glide-коригирана средна скорост за цялата активност)")
+    st.markdown("""
+**Обобщение по активности**  
+(downhill показатели + реална и glide-коригирана средна скорост за цялата активност)
+""")
 
     if not summary_df.empty:
         st.dataframe(
