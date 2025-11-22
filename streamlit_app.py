@@ -54,45 +54,52 @@ def parse_tcx(file) -> pd.DataFrame:
     """
     Връща DataFrame с колони:
     ['time_s', 'dist_m', 'alt_m']
-    time_s – секунди от началото на активността
+    time_s – секунди от началото на активността.
+
+    Тази версия игнорира namespace-и и работи с почти всички TCX формати.
     """
     content = file.read()
-    try:
-        tree = ET.fromstring(content)
-    except ET.ParseError:
-        # опит с decode, ако е bytes
-        tree = ET.fromstring(content.decode("utf-8"))
 
-    ns = {
-        "tcx": "http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2",
-    }
+    # Превръщаме в текст
+    if isinstance(content, bytes):
+        try:
+            xml_text = content.decode("utf-8")
+        except UnicodeDecodeError:
+            xml_text = content.decode("latin-1")
+    else:
+        xml_text = content
 
-    # Някои TCX нямат namespace – fallback
-    def _findall(elem, path):
-        res = elem.findall(path, ns)
-        if not res:
-            res = elem.findall(path)
-        return res
+    # Парсваме XML
+    root = ET.fromstring(xml_text)
 
-    trackpoints = _findall(tree, ".//tcx:Trackpoint")
-    if not trackpoints:
-        trackpoints = _findall(tree, ".//Trackpoint")
+    # Намираме всички Trackpoint елементи, игнорирайки namespace-а
+    trackpoints = [tp for tp in root.iter() if tp.tag.endswith("Trackpoint")]
+
+    if len(trackpoints) == 0:
+        # няма нито един trackpoint
+        return pd.DataFrame(columns=["time_s", "dist_m", "alt_m"])
 
     times = []
     dists = []
     alts = []
 
     for tp in trackpoints:
-        t_el = tp.find("tcx:Time", ns) or tp.find("Time")
+        # helper, който търси дете по име, без значение namespace
+        def find_child(elem, name):
+            for ch in elem:
+                if ch.tag.endswith(name):
+                    return ch
+            return None
+
+        t_el = find_child(tp, "Time")
         if t_el is None or t_el.text is None:
             continue
-        time_str = t_el.text.strip()
 
-        # Разчитаме ISO време (може и само да го поредим)
+        time_str = t_el.text.strip()
         times.append(pd.to_datetime(time_str))
 
-        d_el = tp.find("tcx:DistanceMeters", ns) or tp.find("DistanceMeters")
-        a_el = tp.find("tcx:AltitudeMeters", ns) or tp.find("AltitudeMeters")
+        d_el = find_child(tp, "DistanceMeters")
+        a_el = find_child(tp, "AltitudeMeters")
 
         dist = float(d_el.text) if (d_el is not None and d_el.text) else np.nan
         alt = float(a_el.text) if (a_el is not None and a_el.text) else np.nan
@@ -115,7 +122,7 @@ def parse_tcx(file) -> pd.DataFrame:
     t0 = df["time"].iloc[0]
     df["time_s"] = (df["time"] - t0).dt.total_seconds()
 
-    # Попълваме липсващи височини и дистанции (ако има)
+    # Попълване на липсващи стойности
     df["dist_m"] = df["dist_m"].interpolate().bfill().ffill()
     df["alt_m"] = df["alt_m"].interpolate().bfill().ffill()
 
