@@ -518,9 +518,9 @@ def assign_zones(df: pd.DataFrame, cs: float, z_bounds: dict, speed_min_zone: fl
         return d
 
     # маски
-    move_mask = d["V_kmh"] >= speed_min_zone
-    down_mask = (d["slope_pct"] <= -3.0) & move_mask
-    flat_up_mask = (d["slope_pct"] > -3.0) & move_mask
+       move_mask    = d["V_kmh"] >= speed_min_zone
+    down_mask    = (d["slope_pct"] <= -5.0) & move_mask   # спускане < -5%
+    flat_up_mask = (d["slope_pct"] > -5.0) & move_mask    # всичко останало
 
     # Z1 – взимаме средата на диапазона
     z1_lo, z1_hi = z_bounds["Z1"]
