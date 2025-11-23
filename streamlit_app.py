@@ -504,6 +504,12 @@ def compute_slope_model(segments_glide: pd.DataFrame):
 # Модел 3 – Зони + пулс
 # --------------------------------------------------------------------------------
 def assign_zones(df: pd.DataFrame, cs: float, z_bounds: dict) -> pd.DataFrame:
+    """
+    - Всички сегменти се модулират по двата модела -> V_final.
+    - Зони се определят спрямо ratio = V_final / CS.
+    - Сегментите със slope <= -3% НАРОЧНО се броят в Z1,
+      независимо от ratio (спускания).
+    """
     d = df.copy()
     if d.empty or cs <= 0:
         d["V_eff"] = np.nan
@@ -511,14 +517,8 @@ def assign_zones(df: pd.DataFrame, cs: float, z_bounds: dict) -> pd.DataFrame:
         d["zone"] = None
         return d
 
-    rZ1_high = z_bounds["Z1"][1]
-
-    def v_eff_row(row):
-        if row["slope_pct"] <= -3.0:
-            return rZ1_high * cs
-        return row["V_final"]
-
-    d["V_eff"] = d.apply(v_eff_row, axis=1)
+    # базово – ефективна скорост = финалната модулирана скорост
+    d["V_eff"] = d["V_final"]
     d["ratio"] = d["V_eff"] / cs
 
     def get_zone(r):
@@ -527,10 +527,16 @@ def assign_zones(df: pd.DataFrame, cs: float, z_bounds: dict) -> pd.DataFrame:
                 return z_name
         return "Z6+"
 
-    d["zone"] = d["ratio"].apply(get_zone)
+    # първо класифицираме всички не-спускания по ratio
+    down_mask = d["slope_pct"] <= -3.0
+    d["zone"] = None
+    d.loc[~down_mask, "zone"] = d.loc[~down_mask, "ratio"].apply(get_zone)
+
+    # всички сегменти със slope <= -3% -> зона Z1 (спускания)
+    d.loc[down_mask, "zone"] = "Z1"
+
     return d
-
-
+    
 def zone_summary(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(
