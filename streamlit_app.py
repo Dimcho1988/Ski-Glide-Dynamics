@@ -235,7 +235,7 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
     downhill_mask = seg["is_downhill"] & seg["is_prev_downhill"]
     down_df = seg.loc[downhill_mask].copy()
 
-    if len(down_df) < 20:
+    if len(down_df) < 10:
         seg["K_glide_raw"] = 1.0
         seg["K_glide_soft"] = 1.0
         seg["V_glide"] = seg["V_kmh"]
@@ -267,7 +267,7 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
     R_high = down_df["R"].quantile(0.95)
     down_df = down_df[(down_df["R"] >= R_low) & (down_df["R"] <= R_high)].copy()
 
-    if len(down_df) < 20:
+    if len(down_df) < 10:
         seg["K_glide_raw"] = 1.0
         seg["K_glide_soft"] = 1.0
         seg["V_glide"] = seg["V_kmh"]
