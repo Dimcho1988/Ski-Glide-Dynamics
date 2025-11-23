@@ -14,16 +14,17 @@ MIN_POINTS_SEG = 5       # минимум точки в сегмента
 MIN_D_SEG = 5.0          # минимум хоризонтална дистанция [m]
 MIN_T_SEG = 3.0          # минимум продължителност [s]
 MAX_ABS_SLOPE = 30.0     # макс. наклон [%]
-V_MAX_KMH = 60.0         # макс. скорост [km/h] за филтър на артефакти
-VERT_GRAD_MAX = 4.0      # (вече НЕ се използва като филтър, само за инфо ако ти потрябва)
+V_MAX_KMH = 60.0         # (вече не се ползва като филтър, оставено само за евентуална диагностика)
 
-DOWN_MIN = -15.0         # долна граница за downhill [%]
+DOWN_MIN = -15.0         # долна граница за downhill [%] за Glide модела
 DOWN_MAX = -5.0          # горна граница за downhill [%]
 
 SLOPE_MODEL_MIN = -3.0   # диапазон за ΔV% модела
 SLOPE_MODEL_MAX = 10.0
 
 FLAT_BAND = 1.0          # |slope| <= 1% се счита за "равно"
+
+DOWNHILL_ZONE1_THRESH = -5.0  # всичко под -5% -> Z1, "без усилие"
 
 
 # --------------------------------------------------------------------------------
@@ -102,56 +103,25 @@ def parse_tcx(file: BytesIO, activity_id: str) -> pd.DataFrame:
 
 def preprocess_points(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Предварителна обработка:
+    НЯМА филтриране – само:
     - сортиране по време
-    - медианно изглаждане на височината (3 точки)
-    - филтър за невалидни интервали (обратно време, обратно движение,
-      нереално висока инстантна хоризонтална скорост)
-
-    ВАЖНО: филтърът по вертикален градиент е махнат,
-    за да не режем цели участъци при шум в височината.
+    - time_sec за сегментация
+    - alt_smooth = alt (работим със суровата височина)
     """
     if df.empty:
         return df
 
     df = df.sort_values("time").reset_index(drop=True)
-
-    # изглаждане на височината
-    df["alt_smooth"] = df["alt"].rolling(window=3, center=True, min_periods=1).median()
-
+    df["alt_smooth"] = df["alt"]          # сурови данни
     df["time_sec"] = df["time"].astype("int64") / 1e9
-    df["dt"] = df["time_sec"].diff()
-    df["dd"] = df["dist"].diff()
-    df["dh"] = df["alt_smooth"].diff()
-
-    df["v_kmh_inst"] = (df["dd"] / df["dt"]) * 3.6
-    df["vert_grad"] = df["dh"] / df["dt"]
-
-    # Оставяме само филтри за наистина невъзможни данни:
-    valid = pd.Series(True, index=df.index)
-    valid &= df["dt"].fillna(1) > 0               # време трябва да расте
-    valid &= df["dd"].fillna(0) >= 0              # да няма обратно движение
-    valid &= df["v_kmh_inst"].fillna(0).abs() <= V_MAX_KMH  # твърде бързо => артефакт
-    # НЯМА филтър по vert_grad – шумът във височината ще се ограничи на ниво сегмент чрез MAX_ABS_SLOPE
-
-    df_clean = df.loc[valid].copy().reset_index(drop=True)
-
-    # преизчисляваме производните върху почистените точки
-    df_clean["time_sec"] = df_clean["time"].astype("int64") / 1e9
-    df_clean["dt"] = df_clean["time_sec"].diff()
-    df_clean["dd"] = df_clean["dist"].diff()
-    df_clean["dh"] = df_clean["alt_smooth"].diff()
-    df_clean["v_kmh_inst"] = (df_clean["dd"] / df_clean["dt"]) * 3.6
-
-    return df_clean
+    return df
 
 
 def build_segments(df: pd.DataFrame, activity_id: str, t_seg: float = T_SEG) -> pd.DataFrame:
     """
-    Прави 5-секундни сегменти без припокриване.
-    Връща DF с колони:
-    ['activity_id','seg_id','t_start','t_end','duration_s','D_m','dh_m',
-     'slope_pct','V_kmh','hr_mean']
+    Прави 5-секундни сегменти без припокриване върху СУРОВИТЕ данни.
+    Взима само първа и последна точка в сегмента за:
+    - Δh, Δd, slope, V
     """
     if df.empty:
         return pd.DataFrame(
@@ -175,6 +145,7 @@ def build_segments(df: pd.DataFrame, activity_id: str, t_seg: float = T_SEG) -> 
 
     seg_rows = []
     for seg_id, g in df.groupby("seg_id"):
+        g = g.sort_values("time")
         if len(g) < MIN_POINTS_SEG:
             continue
 
@@ -184,11 +155,15 @@ def build_segments(df: pd.DataFrame, activity_id: str, t_seg: float = T_SEG) -> 
         if duration < MIN_T_SEG:
             continue
 
-        D = g["dist"].iloc[-1] - g["dist"].iloc[0]
+        dist_start = g["dist"].iloc[0]
+        dist_end = g["dist"].iloc[-1]
+        D = dist_end - dist_start
         if D < MIN_D_SEG:
             continue
 
-        dh = g["alt_smooth"].iloc[-1] - g["alt_smooth"].iloc[0]
+        alt_start = g["alt_smooth"].iloc[0]
+        alt_end = g["alt_smooth"].iloc[-1]
+        dh = alt_end - alt_start
         slope = (dh / D) * 100.0 if D > 0 else np.nan
         if np.isnan(slope) or abs(slope) > MAX_ABS_SLOPE:
             continue
@@ -486,7 +461,7 @@ def assign_zones(df: pd.DataFrame, cs: float, z_bounds: dict, speed_min_zone: fl
     """
     - Зоните се базират на V_final (двойно модулирана скорост).
     - В зоните влизат само сегменти с V_kmh >= speed_min_zone.
-    - Спусканията (slope <= -3%) при движение винаги са Z1,
+    - Спусканията (slope <= -5%) при движение винаги са Z1,
       като им задаваме фиксирана "Z1 скорост" (средата на диапазона на Z1).
     - Сегментите с V_kmh < speed_min_zone (стрелба/почивки) не влизат в зоните.
     """
@@ -498,8 +473,8 @@ def assign_zones(df: pd.DataFrame, cs: float, z_bounds: dict, speed_min_zone: fl
         return d
 
     move_mask = d["V_kmh"] >= speed_min_zone
-    down_mask = (d["slope_pct"] <= -3.0) & move_mask
-    flat_up_mask = (d["slope_pct"] > -3.0) & move_mask
+    down_mask = (d["slope_pct"] <= DOWNHILL_ZONE1_THRESH) & move_mask
+    flat_up_mask = (d["slope_pct"] > DOWNHILL_ZONE1_THRESH) & move_mask
 
     # Z1 – взимаме средата на диапазона
     z1_lo, z1_hi = z_bounds["Z1"]
@@ -521,7 +496,7 @@ def assign_zones(df: pd.DataFrame, cs: float, z_bounds: dict, speed_min_zone: fl
 
     d.loc[flat_up_mask, "zone"] = d.loc[flat_up_mask, "ratio"].apply(get_zone)
 
-    # 2) спускания при движение – фиксирана Z1 скорост
+    # 2) спускания при движение – фиксирана Z1 скорост (без усилие)
     d.loc[down_mask, "ratio"] = z1_ratio
     d.loc[down_mask, "V_eff"] = z1_ratio * cs
     d.loc[down_mask, "zone"] = "Z1"
@@ -684,7 +659,7 @@ for i, f in enumerate(uploaded_files, start=1):
     else:
         V_overall_real_raw = np.nan
 
-    # 2) Сегменти за моделите – върху почистените данни
+    # 2) Сегменти за моделите – ВЪРХУ СУРОВИТЕ ДАННИ
     df_clean = preprocess_points(df_points_raw)
     seg_df = build_segments(df_clean, activity_id, T_SEG)
     if seg_df.empty:
@@ -919,7 +894,8 @@ st.markdown(
 и референтна плъзгаемост.
 
 В зоните влизат само движещите се сегменти (V ≥ праг),  
-спусканията при движение са в Z1, а стрелба/почивка се изключват.
+спусканията със **slope ≤ -5%** при движение се считат за **без усилие** и се
+наливат директно в Z1 с фиксирана ефективна скорост.
 """
 )
 
@@ -948,6 +924,7 @@ if not zones_table.empty:
     st.altair_chart(chart, use_container_width=True)
 
 st.success(
-    "Филтърът по вертикален градиент е отпаднал – режем само напълно невъзможни данни. "
-    "Останалата логика за плъзгаемост, наклон и зони е запазена."
+    "Филтрите от суровите данни са премахнати – сегментите се правят директно от TCX, "
+    "наклонът се смята от първа и последна точка. "
+    "Всички сегменти със slope ≤ -5% при движение влизат директно в Z1."
 )
