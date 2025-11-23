@@ -506,10 +506,11 @@ def assign_zones(df: pd.DataFrame, cs: float, z_bounds: dict, speed_min_zone: fl
     """
     - Зоните се базират на V_final (двойно модулирана скорост).
     - В зоните влизат само сегменти с V_kmh >= speed_min_zone.
-    - Спусканията (slope <= -3%) при движение винаги са Z1,
-      като им задаваме фиксирана "Z1 скорост" (средата на диапазона на Z1).
-    - Сегментите с V_kmh < speed_min_zone (стрелба/почивки) не влизат в зоните.
+    - Спусканията (slope <= -5%) при движение винаги са Z1,
+      като им задаваме фиксирана "Z1 скорост".
+    - Сегментите с V_kmh < speed_min_zone (стрелба/почивки) НЕ влизат в зоните.
     """
+
     d = df.copy()
     if d.empty or cs <= 0:
         d["V_eff"] = np.nan
@@ -517,22 +518,23 @@ def assign_zones(df: pd.DataFrame, cs: float, z_bounds: dict, speed_min_zone: fl
         d["zone"] = None
         return d
 
-    # маски
-       move_mask    = d["V_kmh"] >= speed_min_zone
-    down_mask    = (d["slope_pct"] <= -5.0) & move_mask   # спускане < -5%
-    flat_up_mask = (d["slope_pct"] > -5.0) & move_mask    # всичко останало
+    # --- Маски ---
+    move_mask    = d["V_kmh"] >= speed_min_zone
+    down_mask    = (d["slope_pct"] <= -5.0) & move_mask       # СПУСКАНЕ < -5%
+    flat_up_mask = (d["slope_pct"] > -5.0) & move_mask        # ВСИЧКО ДРУГО
 
-    # Z1 – взимаме средата на диапазона
-    z1_lo, z1_hi = z_bounds["Z1"]
-    z1_ratio = 0.5 * (z1_lo + z1_hi)  # например 0.40 => 40% от CS
+    # Z1 фиксирана скорост (средата на зоната)
+    z1_lo, z1_hi = z_bounds["Z1"]   # напр. (0.00, 0.80)
+    z1_ratio = 0.5 * (z1_lo + z1_hi)
 
+    # Подготвяне на колоните
     d["V_eff"] = np.nan
     d["ratio"] = np.nan
     d["zone"] = None
 
-    # 1) сегменти (без спускания) – V_eff = V_final
-    d.loc[flat_up_mask, "V_eff"] = d.loc[flat_up_mask, "V_final"]
-    d.loc[flat_up_mask, "ratio"] = d.loc[flat_up_mask, "V_eff"] / cs
+    # --- 1) Сегменти с наклон > -5% → зони по ratio ---
+    d.loc[flat_up_mask, "V_eff"]  = d.loc[flat_up_mask, "V_final"]
+    d.loc[flat_up_mask, "ratio"]  = d.loc[flat_up_mask, "V_eff"] / cs
 
     def get_zone(r):
         for z_name, (lo, hi) in z_bounds.items():
@@ -542,14 +544,15 @@ def assign_zones(df: pd.DataFrame, cs: float, z_bounds: dict, speed_min_zone: fl
 
     d.loc[flat_up_mask, "zone"] = d.loc[flat_up_mask, "ratio"].apply(get_zone)
 
-    # 2) спускания при движение – фиксирана Z1 скорост
+    # --- 2) СПУСКАНИЯ при движение (slope <= -5%) → фиксирана Z1 скорост ---
     d.loc[down_mask, "ratio"] = z1_ratio
     d.loc[down_mask, "V_eff"] = z1_ratio * cs
-    d.loc[down_mask, "zone"] = "Z1"
+    d.loc[down_mask, "zone"]  = "Z1"
 
-    # 3) V_kmh < speed_min_zone => zone остава None (излизат от анализа)
+    # --- 3) Сегменти без движение (< min speed) → остават zone=None ---
+    # те няма да участват в zone_summary()
+
     return d
-
 
 def zone_summary(df: pd.DataFrame) -> pd.DataFrame:
     """
