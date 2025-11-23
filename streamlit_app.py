@@ -345,8 +345,8 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
                 "V_down_model": V_down_model,
                 "K_glide_raw": K_raw,
                 "K_glide_soft": K_soft,
-                "V_overall_real": V_overall_real_seg,   # временно – после ще го заменим с константата
-                "V_overall_glide": V_overall_glide_seg, # временна стойност
+                "V_overall_real": V_overall_real_seg,   # временно
+                "V_overall_glide": V_overall_glide_seg, # временно
             }
         )
 
@@ -489,7 +489,6 @@ def compute_slope_model(segments_glide: pd.DataFrame):
                 "n_slope_segments": len(g_train),
                 "mean_slope_model": mean_slope_model,
                 "mean_DeltaV_real": mean_DeltaV_real,
-                # тези три са от сегментите – после ще ги пренормируем спрямо константата
                 "V_overall_real": V_overall_real_seg,
                 "V_overall_glide": V_overall_glide_seg,
                 "V_overall_final": V_overall_final_seg,
@@ -503,12 +502,13 @@ def compute_slope_model(segments_glide: pd.DataFrame):
 # --------------------------------------------------------------------------------
 # Модел 3 – Зони + пулс
 # --------------------------------------------------------------------------------
-def assign_zones(df: pd.DataFrame, cs: float, z_bounds: dict) -> pd.DataFrame:
+def assign_zones(df: pd.DataFrame, cs: float, z_bounds: dict, speed_min_zone: float) -> pd.DataFrame:
     """
-    - Всички сегменти се модулират по двата модела -> V_final.
-    - Зони се определят спрямо ratio = V_final / CS.
-    - Сегментите със slope <= -3% НАРОЧНО се броят в Z1,
-      независимо от ratio (спускания).
+    - Зоните се базират на V_final (двойно модулирана скорост).
+    - В зоните влизат само сегменти с V_kmh >= speed_min_zone.
+    - Спусканията (slope <= -3%) при движение винаги са Z1,
+      като им задаваме фиксирана "Z1 скорост" (средата на диапазона на Z1).
+    - Сегментите с V_kmh < speed_min_zone (стрелба/почивки) не влизат в зоните.
     """
     d = df.copy()
     if d.empty or cs <= 0:
@@ -517,9 +517,22 @@ def assign_zones(df: pd.DataFrame, cs: float, z_bounds: dict) -> pd.DataFrame:
         d["zone"] = None
         return d
 
-    # базово – ефективна скорост = финалната модулирана скорост
-    d["V_eff"] = d["V_final"]
-    d["ratio"] = d["V_eff"] / cs
+    # маски
+    move_mask = d["V_kmh"] >= speed_min_zone
+    down_mask = (d["slope_pct"] <= -3.0) & move_mask
+    flat_up_mask = (d["slope_pct"] > -3.0) & move_mask
+
+    # Z1 – взимаме средата на диапазона
+    z1_lo, z1_hi = z_bounds["Z1"]
+    z1_ratio = 0.5 * (z1_lo + z1_hi)  # например 0.40 => 40% от CS
+
+    d["V_eff"] = np.nan
+    d["ratio"] = np.nan
+    d["zone"] = None
+
+    # 1) сегменти (без спускания) – V_eff = V_final
+    d.loc[flat_up_mask, "V_eff"] = d.loc[flat_up_mask, "V_final"]
+    d.loc[flat_up_mask, "ratio"] = d.loc[flat_up_mask, "V_eff"] / cs
 
     def get_zone(r):
         for z_name, (lo, hi) in z_bounds.items():
@@ -527,18 +540,27 @@ def assign_zones(df: pd.DataFrame, cs: float, z_bounds: dict) -> pd.DataFrame:
                 return z_name
         return "Z6+"
 
-    # първо класифицираме всички не-спускания по ratio
-    down_mask = d["slope_pct"] <= -3.0
-    d["zone"] = None
-    d.loc[~down_mask, "zone"] = d.loc[~down_mask, "ratio"].apply(get_zone)
+    d.loc[flat_up_mask, "zone"] = d.loc[flat_up_mask, "ratio"].apply(get_zone)
 
-    # всички сегменти със slope <= -3% -> зона Z1 (спускания)
+    # 2) спускания при движение – фиксирана Z1 скорост
+    d.loc[down_mask, "ratio"] = z1_ratio
+    d.loc[down_mask, "V_eff"] = z1_ratio * cs
     d.loc[down_mask, "zone"] = "Z1"
 
+    # 3) V_kmh < speed_min_zone => zone остава None (излизат от анализа)
     return d
-    
+
+
 def zone_summary(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
+    """
+    Прави таблица по зони (без стрелба/почивки, които са zone=None):
+    - време [min]
+    - % от времето
+    - средна V_eff [km/h]
+    - среден HR
+    """
+    d = df[df["zone"].notna()].copy()
+    if d.empty:
         return pd.DataFrame(
             columns=[
                 "zone",
@@ -549,12 +571,12 @@ def zone_summary(df: pd.DataFrame) -> pd.DataFrame:
             ]
         )
 
-    total_time = df["duration_s"].sum()
+    total_time = d["duration_s"].sum()
     if total_time <= 0:
         total_time = 1.0
 
     rows = []
-    for zone, g in df.groupby("zone"):
+    for zone, g in d.groupby("zone"):
         T = g["duration_s"].sum()
         time_min = T / 60.0
         time_percent = 100.0 * T / total_time
@@ -624,6 +646,15 @@ cs = st.sidebar.number_input(
     max_value=40.0,
     value=cs_default,
     step=0.5,
+)
+
+speed_min_zone = st.sidebar.number_input(
+    "Мин. скорост за зони [km/h]",
+    min_value=0.0,
+    max_value=10.0,
+    value=2.0,
+    step=0.5,
+    help="Сегменти с по-ниска скорост (стрелба, почивка) не влизат в зоните."
 )
 
 st.sidebar.markdown("---")
@@ -724,10 +755,9 @@ segments_glide, glide_summary, glide_poly = compute_glide_model(
 if glide_summary.empty:
     st.warning("Няма достатъчно downhill сегменти за модел на плъзгаемостта.")
 else:
-    # === Тук налагаме константната реална скорост от първата таблица ===
+    # заменяме реалната скорост с константата от суровия TCX
     real_map = info_df.set_index("activity_id")["V_overall_real"]
     glide_summary["V_overall_real"] = glide_summary["activity_id"].map(real_map)
-    # Модулирана по плъзгаемост: делим реалната на K_glide_soft
     glide_summary["V_overall_glide"] = (
         glide_summary["V_overall_real"] / glide_summary["K_glide_soft"]
     )
@@ -796,20 +826,17 @@ segments_slope, slope_summary, slope_poly = compute_slope_model(segments_glide)
 if slope_summary.empty:
     st.warning("Няма достатъчно сегменти за модел на наклона.")
 else:
-    # първо си запазваме сегмент-базираните стойности, за да извадим коефициента на релефа
+    # коефициент на релеф от сегментните средни
     slope_summary["terrain_factor"] = (
         slope_summary["V_overall_final"] / slope_summary["V_overall_glide"]
     ).replace([np.inf, -np.inf], np.nan)
 
-    # сега заменяме реалната скорост с тази от първата таблица
     real_map = info_df.set_index("activity_id")["V_overall_real"]
     slope_summary["V_overall_real"] = slope_summary["activity_id"].map(real_map)
 
-    # V_overall_glide взимаме от резултата на Модел 1 (вече нормализиран)
     glide_map = glide_summary.set_index("activity_id")["V_overall_glide"]
     slope_summary["V_overall_glide"] = slope_summary["activity_id"].map(glide_map)
 
-    # крайна модулирана скорост = скорост по плъзгаемост * коеф. релеф
     slope_summary["V_overall_final"] = (
         slope_summary["V_overall_glide"] * slope_summary["terrain_factor"]
     )
@@ -821,9 +848,6 @@ else:
 Облакът за модела е от:
 - **наклон [%]**
 - **процентно отклонение ΔV% от V_flat на съответната активност**
-
-В таблицата средната реална скорост е същата, както в базовата таблица;
-модела за наклона само я модулира.
 """
     )
 
@@ -901,7 +925,12 @@ if selected_activity == "Всички активности":
 else:
     seg_for_zones = segments_slope[segments_slope["activity_id"] == selected_activity].copy()
 
-seg_zoned = assign_zones(seg_for_zones, cs=cs, z_bounds=z_bounds)
+seg_zoned = assign_zones(
+    seg_for_zones,
+    cs=cs,
+    z_bounds=z_bounds,
+    speed_min_zone=speed_min_zone,
+)
 zones_table = zone_summary(seg_zoned)
 
 st.markdown(
@@ -910,11 +939,8 @@ st.markdown(
 (коригирана по плъзгаемост и наклон), приравнена към равен терен
 и референтна плъзгаемост.
 
-За всяка зона:
-- време в зона (min)
-- % време
-- средна модулирана скорост V_eff
-- среден пулс (ако има HR данни)
+В зоните влизат само движещите се сегменти (V ≥ праг),  
+спусканията при движение са в Z1, а стрелба/почивка се изключват.
 """
 )
 
@@ -943,7 +969,8 @@ if not zones_table.empty:
     st.altair_chart(chart, use_container_width=True)
 
 st.success(
-    "Средната реална скорост е константна за всяка активност (от суровия TCX). "
-    "Модел 1 (плъзгаемост) и Модел 2 (наклон) само я модулират, "
-    "а Модел 3 прави зоните върху финалната модулирана скорост."
+    "Средната реална скорост по активност е константа (от суровия TCX). "
+    "Модел 1 (плъзгаемост) и Модел 2 (наклон) я модулират, "
+    "а Модел 3 прави зоните само от движещите се сегменти, "
+    "като спусканията са в Z1."
 )
