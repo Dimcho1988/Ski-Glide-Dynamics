@@ -48,7 +48,6 @@ def parse_tcx(file: BytesIO, activity_id: str) -> pd.DataFrame:
 
     rows = []
     for tp in trackpoints:
-        # време
         time_el = tp.find("tcx:Time", ns)
         dist_el = tp.find("tcx:DistanceMeters", ns)
         alt_el = tp.find("tcx:AltitudeMeters", ns)
@@ -128,18 +127,15 @@ def preprocess_points(df: pd.DataFrame) -> pd.DataFrame:
     # вертикален градиент [m/s]
     df["vert_grad"] = df["dh"] / df["dt"]
 
-    # първата точка няма dt; оставяме я
     valid = pd.Series(True, index=df.index)
     valid &= df["dt"].fillna(1) > 0
-    valid &= df["dt"].fillna(1) < 30  # много дълги интервали -> шум
+    valid &= df["dt"].fillna(1) < 30
     valid &= df["dd"].fillna(0) >= 0
     valid &= df["v_kmh_inst"].fillna(0).abs() <= V_MAX_KMH
     valid &= df["vert_grad"].fillna(0).abs() <= VERT_GRAD_MAX
 
-    # запазваме първата точка + точки след валидни интервали
     df_clean = df.loc[valid].copy().reset_index(drop=True)
 
-    # преизчисляваме dt, dd, dh след филтрирането
     df_clean["time_sec"] = df_clean["time"].astype("int64") / 1e9
     df_clean["dt"] = df_clean["time_sec"].diff()
     df_clean["dd"] = df_clean["dist"].diff()
@@ -197,7 +193,6 @@ def build_segments(df: pd.DataFrame, activity_id: str, t_seg: float = T_SEG) -> 
             continue
 
         V_kmh = (D / duration) * 3.6
-
         hr_mean = g["hr"].mean()
 
         seg_rows.append(
@@ -233,25 +228,22 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
     if seg.empty:
         return seg, pd.DataFrame(), None
 
-    # сортираме по activity + seg_id
     seg = seg.sort_values(["activity_id", "seg_id"]).reset_index(drop=True)
 
     # downhill сегменти
     seg["is_downhill"] = (seg["slope_pct"] >= DOWN_MIN) & (seg["slope_pct"] <= DOWN_MAX)
 
-    # условие: предходният сегмент също да е downhill
+    # условие: предходният сегмент също да е downhill – правим го с shift вътре в групата
     seg["is_prev_downhill"] = False
     for aid, g in seg.groupby("activity_id"):
         idx = g.index
-        # previous index within activity
-        prev_idx = idx.to_series().shift(1)
-        seg.loc[idx, "is_prev_downhill"] = seg.loc[prev_idx, "is_downhill"].fillna(False).values
+        prev_down = g["is_downhill"].shift(1).fillna(False).values
+        seg.loc[idx, "is_prev_downhill"] = prev_down
 
     downhill_mask = seg["is_downhill"] & seg["is_prev_downhill"]
     down_df = seg.loc[downhill_mask].copy()
 
     if len(down_df) < 20:
-        # няма достатъчно данни -> няма модел
         seg["K_glide_raw"] = 1.0
         seg["K_glide_soft"] = 1.0
         seg["V_glide"] = seg["V_kmh"]
@@ -278,7 +270,7 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
         )
         return seg, summary, None
 
-    # премахване на аутлайъри по R = V/|slope|
+    # премахване на аутлайъри
     down_df["R"] = down_df["V_kmh"] / down_df["slope_pct"].abs()
     R_low = down_df["R"].quantile(0.05)
     R_high = down_df["R"].quantile(0.95)
@@ -311,7 +303,7 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
         )
         return seg, summary, None
 
-    # Регресия V = f(slope) (deg_glide: 1 или 2)
+    # Регресия V = f(slope)
     x = down_df["slope_pct"].values
     y = down_df["V_kmh"].values
     try:
@@ -320,7 +312,6 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
     except Exception:
         glide_poly = None
 
-    # изчисляваме K_glide по активности
     activity_rows = []
     seg["K_glide_raw"] = 1.0
     seg["K_glide_soft"] = 1.0
@@ -342,7 +333,6 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
                 K_raw = 1.0
             else:
                 K_raw = mean_down_V_real / V_down_model
-            # защита от екстремни стойности
             if not np.isfinite(K_raw) or K_raw <= 0.3 or K_raw >= 1.7:
                 K_raw = 1.0
             K_soft = 1.0 + alpha_glide * (K_raw - 1.0)
@@ -351,7 +341,6 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
         seg.loc[seg["activity_id"] == aid, "K_glide_raw"] = K_raw
         seg.loc[seg["activity_id"] == aid, "K_glide_soft"] = K_soft
 
-        # средни скорости
         V_overall_real = (g["V_kmh"] * g["duration_s"]).sum() / g["duration_s"].sum()
         V_overall_glide = (
             (g["V_kmh"] / K_soft) * g["duration_s"]
@@ -385,23 +374,17 @@ def compute_slope_model(segments_glide: pd.DataFrame):
     Изчислява:
     - V_flat за всяка активност (от |slope|<=1% върху V_glide)
     - ΔV_real_s = 100 * (V_glide_s - V_flat_A) / V_flat_A
-    - квадратичен модел ΔV_model(slope) = c2*s^2 + c1*s + c0
+    - квадратичен модел ΔV_model(slope)
     - V_final_s = V_glide_s / f_slope(slope)
-    Връща:
-    - segments с добавени ['V_flat_A','DeltaV_real','DeltaV_model','V_final']
-    - таблица по активности
-    - poly1d за ΔV модел (или None)
     """
     seg = segments_glide.copy()
     if seg.empty:
         return seg, pd.DataFrame(), None
 
-    # V_flat per activity (|slope|<=1%)
     vflat_map = {}
     for aid, g in seg.groupby("activity_id"):
         flat = g[abs(g["slope_pct"]) <= FLAT_BAND]
         if len(flat) < 5:
-            # fallback: използваме всички сегменти
             flat = g
         V_flat = (flat["V_glide"] * flat["duration_s"]).sum() / flat["duration_s"].sum()
         vflat_map[aid] = V_flat
@@ -409,7 +392,6 @@ def compute_slope_model(segments_glide: pd.DataFrame):
     seg["V_flat_A"] = seg["activity_id"].map(vflat_map)
     seg["DeltaV_real"] = 100.0 * (seg["V_glide"] - seg["V_flat_A"]) / seg["V_flat_A"]
 
-    # сегменти за обучение на ΔV% модел: -3..10% (без равните, по желание)
     train = seg[
         (seg["slope_pct"] > SLOPE_MODEL_MIN)
         & (seg["slope_pct"] < SLOPE_MODEL_MAX)
@@ -417,7 +399,6 @@ def compute_slope_model(segments_glide: pd.DataFrame):
     ].copy()
 
     if len(train) < 20:
-        # няма надежден модел
         seg["DeltaV_model"] = 0.0
         seg["V_final"] = seg["V_glide"]
         summary = (
@@ -482,7 +463,6 @@ def compute_slope_model(segments_glide: pd.DataFrame):
 
     seg["DeltaV_model"] = slope_poly(seg["slope_pct"])
 
-    # f_slope(slope)
     def f_slope(s):
         s_val = float(s)
         if abs(s_val) <= FLAT_BAND:
@@ -495,7 +475,6 @@ def compute_slope_model(segments_glide: pd.DataFrame):
     seg["f_slope"] = seg["slope_pct"].apply(f_slope)
     seg["V_final"] = seg["V_glide"] / seg["f_slope"]
 
-    # обобщение по активности
     activity_rows = []
     for aid, g in seg.groupby("activity_id"):
         g_train = g[
@@ -527,7 +506,6 @@ def compute_slope_model(segments_glide: pd.DataFrame):
         )
 
     summary_df = pd.DataFrame(activity_rows)
-
     return seg, summary_df, slope_poly
 
 
@@ -535,15 +513,6 @@ def compute_slope_model(segments_glide: pd.DataFrame):
 # Модел 3 – Зони + пулс
 # --------------------------------------------------------------------------------
 def assign_zones(df: pd.DataFrame, cs: float, z_bounds: dict) -> pd.DataFrame:
-    """
-    z_bounds: dict от вид:
-      {
-        "Z1": (0.00, 0.80),
-        "Z2": (0.80, 0.90),
-        ...
-      }
-    Добавя колони 'V_eff','ratio','zone'
-    """
     d = df.copy()
     if d.empty or cs <= 0:
         d["V_eff"] = np.nan
@@ -551,8 +520,8 @@ def assign_zones(df: pd.DataFrame, cs: float, z_bounds: dict) -> pd.DataFrame:
         d["zone"] = None
         return d
 
-    # ефективна скорост: ограничаваме спусканията
-    rZ1_high = z_bounds["Z1"][1]  # горна граница на Z1
+    rZ1_high = z_bounds["Z1"][1]
+
     def v_eff_row(row):
         if row["slope_pct"] <= -3.0:
             return rZ1_high * cs
@@ -572,13 +541,6 @@ def assign_zones(df: pd.DataFrame, cs: float, z_bounds: dict) -> pd.DataFrame:
 
 
 def zone_summary(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Прави таблица по зони:
-    - време [min]
-    - % от времето
-    - средна V_eff [km/h]
-    - среден HR
-    """
     if df.empty:
         return pd.DataFrame(
             columns=[
@@ -615,9 +577,7 @@ def zone_summary(df: pd.DataFrame) -> pd.DataFrame:
             }
         )
 
-    # подреждаме зоните по ред
     order = ["Z1", "Z2", "Z3", "Z4", "Z5", "Z6", "Z6+"]
-    zone_cat = pd.Categorical([r["zone"] for r in rows], categories=order, ordered=True)
     df_z = pd.DataFrame(rows)
     df_z["zone"] = pd.Categorical(df_z["zone"], categories=order, ordered=True)
     df_z = df_z.sort_values("zone").reset_index(drop=True)
@@ -641,7 +601,7 @@ st.markdown(
 """
 )
 
-# --- Sidebar настройки ---
+# --- Sidebar ---
 st.sidebar.header("Настройки на модела")
 
 alpha_glide = st.sidebar.slider(
@@ -660,7 +620,7 @@ deg_glide = st.sidebar.selectbox(
     help="1 = линеен, 2 = квадратичен модел",
 )
 
-cs_default = 15.0
+cs_default = 20.0
 cs = st.sidebar.number_input(
     "Критична скорост (CS) [km/h]",
     min_value=1.0,
@@ -679,7 +639,6 @@ z_bounds = {
     "Z5": (1.10, 1.20),
     "Z6": (1.20, 999.0),
 }
-
 for z_name, (lo, hi) in z_bounds.items():
     st.sidebar.write(f"{z_name}: {lo:.2f} – {hi:.2f}")
 
@@ -702,12 +661,24 @@ for i, f in enumerate(uploaded_files, start=1):
     activity_id = f"{i}: {f.name}"
     st.write(f"Обработка на **{activity_id}** ...")
 
-    df_points = parse_tcx(f, activity_id)
-    if df_points.empty:
+    df_points_raw = parse_tcx(f, activity_id)
+    if df_points_raw.empty:
         st.warning(f"⚠ Няма валидни Trackpoint-и в файла: {f.name}")
         continue
 
-    df_clean = preprocess_points(df_points)
+    # 1) Реална скорост – директно от суровите данни (без модулации)
+    df_raw = df_points_raw.sort_values("time").reset_index(drop=True)
+    t_start = df_raw["time"].iloc[0]
+    t_end = df_raw["time"].iloc[-1]
+    total_time_s_raw = (t_end - t_start).total_seconds()
+    total_dist_m_raw = df_raw["dist"].iloc[-1] - df_raw["dist"].iloc[0]
+    if total_time_s_raw > 0:
+        V_overall_real_raw = (total_dist_m_raw / total_time_s_raw) * 3.6
+    else:
+        V_overall_real_raw = np.nan
+
+    # 2) Сегменти за моделите – върху почистените данни
+    df_clean = preprocess_points(df_points_raw)
     seg_df = build_segments(df_clean, activity_id, T_SEG)
     if seg_df.empty:
         st.warning(f"⚠ Няма валидни сегменти в активност: {activity_id}")
@@ -715,18 +686,13 @@ for i, f in enumerate(uploaded_files, start=1):
 
     all_segments.append(seg_df)
 
-    # базова информация
-    total_time = seg_df["duration_s"].sum()
-    total_dist = seg_df["D_m"].sum()
-    V_overall = (seg_df["V_kmh"] * seg_df["duration_s"]).sum() / total_time
-
     info_rows.append(
         {
             "activity_id": activity_id,
             "n_segments": len(seg_df),
-            "time_min": total_time / 60.0,
-            "dist_km": total_dist / 1000.0,
-            "V_overall_real": V_overall,
+            "time_min": total_time_s_raw / 60.0,
+            "dist_km": total_dist_m_raw / 1000.0,
+            "V_overall_real": V_overall_real_raw,
         }
     )
 
@@ -737,8 +703,16 @@ if not all_segments:
 segments = pd.concat(all_segments, ignore_index=True)
 info_df = pd.DataFrame(info_rows)
 
-st.subheader("Базова информация по активност")
-st.dataframe(info_df.style.format({"time_min": "{:.1f}", "dist_km": "{:.2f}", "V_overall_real": "{:.2f}"}))
+st.subheader("Базова информация по активност (реални данни)")
+st.dataframe(
+    info_df.style.format(
+        {
+            "time_min": "{:.1f}",
+            "dist_km": "{:.2f}",
+            "V_overall_real": "{:.2f}",
+        }
+    )
+)
 
 # --------------------------------------------------------------------------------
 # Модел 1 – Плъзгаемост
@@ -768,7 +742,6 @@ else:
         )
     )
 
-    # Визуализация: сегменти + функция V=f(slope)
     down_plot_df = segments_glide[
         segments_glide["is_downhill"] & segments_glide["is_prev_downhill"]
     ].copy()
@@ -808,7 +781,7 @@ else:
         st.info("Няма достатъчно downhill сегменти за визуализация на Glide модела.")
 
 # --------------------------------------------------------------------------------
-# Модел 2 – Наклон (ΔV% спрямо собствено V_flat на всяка активност)
+# Модел 2 – Наклон
 # --------------------------------------------------------------------------------
 st.markdown("---")
 st.subheader("Модел 2 – Влияние на наклона (ΔV%)")
@@ -822,9 +795,9 @@ else:
         """
 В този модел за всеки сегмент използваме **V_glide** и го сравняваме със
 **средната скорост при почти равен наклон (-1..+1%) за същата активност**.
-Облакът за модела се съставя от:
+Облакът за модела е от:
 - **наклон [%]**
-- **процентно отклонение ΔV% от собственото V_flat на активността**
+- **процентно отклонение ΔV% от V_flat на съответната активност**
 """
     )
 
@@ -841,7 +814,6 @@ else:
         )
     )
 
-    # Визуализация: ΔV_real срещу наклон + модел
     train_plot = segments_slope[
         (segments_slope["slope_pct"] > SLOPE_MODEL_MIN)
         & (segments_slope["slope_pct"] < SLOPE_MODEL_MAX)
@@ -882,12 +854,11 @@ else:
         st.info("Няма достатъчно данни за визуализация на ΔV% модела.")
 
 # --------------------------------------------------------------------------------
-# Модел 3 – Зони + пулс (по финалната модулирана скорост)
+# Модел 3 – Зони + пулс
 # --------------------------------------------------------------------------------
 st.markdown("---")
 st.subheader("Модел 3 – Разпределение по зони + пулс")
 
-# избор: всички активности или конкретна
 activity_options = ["Всички активности"] + sorted(segments_slope["activity_id"].unique())
 selected_activity = st.selectbox("Избери активност за зонирането", activity_options)
 
@@ -905,11 +876,11 @@ st.markdown(
 (коригирана по плъзгаемост и наклон), приравнена към равен терен
 и референтна плъзгаемост.
 
-За всяка зона се показват:
-- **време в зона** (min)
-- **% време**
-- **средна модулирана скорост V_eff**
-- **среден пулс** на сегментите в зоната (ако има HR данни)
+За всяка зона:
+- време в зона (min)
+- % време
+- средна модулирана скорост V_eff
+- среден пулс (ако има HR данни)
 """
 )
 
@@ -924,7 +895,6 @@ st.dataframe(
     )
 )
 
-# Бар диаграма по % време в зона
 if not zones_table.empty:
     st.markdown("**Графика: % време по зони**")
     chart = (
@@ -938,4 +908,7 @@ if not zones_table.empty:
     )
     st.altair_chart(chart, use_container_width=True)
 
-st.success("Готово – трите модела са изчислени. Реалната скорост идва от всички валидни сегменти, а моделациите са по плъзгаемост и наклон според описанието.")
+st.success(
+    "Реалната скорост е взета директно от суровия TCX (без модулация), "
+    "а моделите за плъзгаемост, наклон и зони са изчислени върху сегментите."
+)
