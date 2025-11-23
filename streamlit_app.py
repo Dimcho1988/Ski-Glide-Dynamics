@@ -36,7 +36,6 @@ def parse_tcx(file: BytesIO, activity_id: str) -> pd.DataFrame:
     tree = ET.parse(file)
     root = tree.getroot()
 
-    # TCX има namespace; намираме го автоматично
     ns = {}
     if root.tag[0] == "{":
         uri = root.tag[1:].split("}")[0]
@@ -112,19 +111,14 @@ def preprocess_points(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.sort_values("time").reset_index(drop=True)
 
-    # изглаждане на височината
     df["alt_smooth"] = df["alt"].rolling(window=3, center=True, min_periods=1).median()
 
-    # диференциране
     df["time_sec"] = df["time"].astype("int64") / 1e9
     df["dt"] = df["time_sec"].diff()
     df["dd"] = df["dist"].diff()
     df["dh"] = df["alt_smooth"].diff()
 
-    # скорост [km/h] между точки
     df["v_kmh_inst"] = (df["dd"] / df["dt"]) * 3.6
-
-    # вертикален градиент [m/s]
     df["vert_grad"] = df["dh"] / df["dt"]
 
     valid = pd.Series(True, index=df.index)
@@ -230,10 +224,8 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
 
     seg = seg.sort_values(["activity_id", "seg_id"]).reset_index(drop=True)
 
-    # downhill сегменти
     seg["is_downhill"] = (seg["slope_pct"] >= DOWN_MIN) & (seg["slope_pct"] <= DOWN_MAX)
 
-    # условие: предходният сегмент също да е downhill – правим го с shift вътре в групата
     seg["is_prev_downhill"] = False
     for aid, g in seg.groupby("activity_id"):
         idx = g.index
@@ -270,7 +262,6 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
         )
         return seg, summary, None
 
-    # премахване на аутлайъри
     down_df["R"] = down_df["V_kmh"] / down_df["slope_pct"].abs()
     R_low = down_df["R"].quantile(0.05)
     R_high = down_df["R"].quantile(0.95)
@@ -303,7 +294,6 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
         )
         return seg, summary, None
 
-    # Регресия V = f(slope)
     x = down_df["slope_pct"].values
     y = down_df["V_kmh"].values
     try:
@@ -341,8 +331,8 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
         seg.loc[seg["activity_id"] == aid, "K_glide_raw"] = K_raw
         seg.loc[seg["activity_id"] == aid, "K_glide_soft"] = K_soft
 
-        V_overall_real = (g["V_kmh"] * g["duration_s"]).sum() / g["duration_s"].sum()
-        V_overall_glide = (
+        V_overall_real_seg = (g["V_kmh"] * g["duration_s"]).sum() / g["duration_s"].sum()
+        V_overall_glide_seg = (
             (g["V_kmh"] / K_soft) * g["duration_s"]
         ).sum() / g["duration_s"].sum()
 
@@ -355,8 +345,8 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
                 "V_down_model": V_down_model,
                 "K_glide_raw": K_raw,
                 "K_glide_soft": K_soft,
-                "V_overall_real": V_overall_real,
-                "V_overall_glide": V_overall_glide,
+                "V_overall_real": V_overall_real_seg,   # временно – после ще го заменим с константата
+                "V_overall_glide": V_overall_glide_seg, # временна стойност
             }
         )
 
@@ -367,7 +357,7 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
 
 
 # --------------------------------------------------------------------------------
-# Модел 2 – Наклон (ΔV%) с нормализация по активност
+# Модел 2 – Наклон
 # --------------------------------------------------------------------------------
 def compute_slope_model(segments_glide: pd.DataFrame):
     """
@@ -489,9 +479,9 @@ def compute_slope_model(segments_glide: pd.DataFrame):
             mean_slope_model = np.nan
             mean_DeltaV_real = np.nan
 
-        V_overall_real = (g["V_kmh"] * g["duration_s"]).sum() / g["duration_s"].sum()
-        V_overall_glide = (g["V_glide"] * g["duration_s"]).sum() / g["duration_s"].sum()
-        V_overall_final = (g["V_final"] * g["duration_s"]).sum() / g["duration_s"].sum()
+        V_overall_real_seg = (g["V_kmh"] * g["duration_s"]).sum() / g["duration_s"].sum()
+        V_overall_glide_seg = (g["V_glide"] * g["duration_s"]).sum() / g["duration_s"].sum()
+        V_overall_final_seg = (g["V_final"] * g["duration_s"]).sum() / g["duration_s"].sum()
 
         activity_rows.append(
             {
@@ -499,9 +489,10 @@ def compute_slope_model(segments_glide: pd.DataFrame):
                 "n_slope_segments": len(g_train),
                 "mean_slope_model": mean_slope_model,
                 "mean_DeltaV_real": mean_DeltaV_real,
-                "V_overall_real": V_overall_real,
-                "V_overall_glide": V_overall_glide,
-                "V_overall_final": V_overall_final,
+                # тези три са от сегментите – после ще ги пренормируем спрямо константата
+                "V_overall_real": V_overall_real_seg,
+                "V_overall_glide": V_overall_glide_seg,
+                "V_overall_final": V_overall_final_seg,
             }
         )
 
@@ -727,6 +718,14 @@ segments_glide, glide_summary, glide_poly = compute_glide_model(
 if glide_summary.empty:
     st.warning("Няма достатъчно downhill сегменти за модел на плъзгаемостта.")
 else:
+    # === Тук налагаме константната реална скорост от първата таблица ===
+    real_map = info_df.set_index("activity_id")["V_overall_real"]
+    glide_summary["V_overall_real"] = glide_summary["activity_id"].map(real_map)
+    # Модулирана по плъзгаемост: делим реалната на K_glide_soft
+    glide_summary["V_overall_glide"] = (
+        glide_summary["V_overall_real"] / glide_summary["K_glide_soft"]
+    )
+
     st.markdown("**Обобщение по активност (реална vs. коригирана по плъзгаемост скорост):**")
     st.dataframe(
         glide_summary.style.format(
@@ -791,6 +790,24 @@ segments_slope, slope_summary, slope_poly = compute_slope_model(segments_glide)
 if slope_summary.empty:
     st.warning("Няма достатъчно сегменти за модел на наклона.")
 else:
+    # първо си запазваме сегмент-базираните стойности, за да извадим коефициента на релефа
+    slope_summary["terrain_factor"] = (
+        slope_summary["V_overall_final"] / slope_summary["V_overall_glide"]
+    ).replace([np.inf, -np.inf], np.nan)
+
+    # сега заменяме реалната скорост с тази от първата таблица
+    real_map = info_df.set_index("activity_id")["V_overall_real"]
+    slope_summary["V_overall_real"] = slope_summary["activity_id"].map(real_map)
+
+    # V_overall_glide взимаме от резултата на Модел 1 (вече нормализиран)
+    glide_map = glide_summary.set_index("activity_id")["V_overall_glide"]
+    slope_summary["V_overall_glide"] = slope_summary["activity_id"].map(glide_map)
+
+    # крайна модулирана скорост = скорост по плъзгаемост * коеф. релеф
+    slope_summary["V_overall_final"] = (
+        slope_summary["V_overall_glide"] * slope_summary["terrain_factor"]
+    )
+
     st.markdown(
         """
 В този модел за всеки сегмент използваме **V_glide** и го сравняваме със
@@ -798,12 +815,23 @@ else:
 Облакът за модела е от:
 - **наклон [%]**
 - **процентно отклонение ΔV% от V_flat на съответната активност**
+
+В таблицата средната реална скорост е същата, както в базовата таблица;
+модела за наклона само я модулира.
 """
     )
 
     st.markdown("**Обобщение по активност:**")
     st.dataframe(
-        slope_summary.style.format(
+        slope_summary[[
+            "activity_id",
+            "n_slope_segments",
+            "mean_slope_model",
+            "mean_DeltaV_real",
+            "V_overall_real",
+            "V_overall_glide",
+            "V_overall_final",
+        ]].style.format(
             {
                 "mean_slope_model": "{:.2f}",
                 "mean_DeltaV_real": "{:.2f}",
@@ -909,6 +937,7 @@ if not zones_table.empty:
     st.altair_chart(chart, use_container_width=True)
 
 st.success(
-    "Реалната скорост е взета директно от суровия TCX (без модулация), "
-    "а моделите за плъзгаемост, наклон и зони са изчислени върху сегментите."
+    "Средната реална скорост е константна за всяка активност (от суровия TCX). "
+    "Модел 1 (плъзгаемост) и Модел 2 (наклон) само я модулират, "
+    "а Модел 3 прави зоните върху финалната модулирана скорост."
 )
