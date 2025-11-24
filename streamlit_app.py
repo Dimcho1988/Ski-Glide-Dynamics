@@ -302,9 +302,12 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
                 delta_shrink = delta * shrink_factor
                 K_raw = 1.0 + delta_shrink
 
-            # 4) допълнително омекотяване с alpha_glide (0..1)
-            K_soft = 1.0 + alpha_glide * (K_raw - 1.0)
-            n_down = len(g_down)
+           # 4) допълнително омекотяване с alpha_glide (0..1),
+#    но с 2 пъти по-малко влияние (factor = 0.5)
+factor = 0.5  # тук контролираш "2 пъти по-малко"; можеш да го пипаш ако искаш
+alpha_eff = alpha_glide * factor
+K_soft = 1.0 + alpha_eff * (K_raw - 1.0)
+
 
         seg.loc[seg["activity_id"] == aid, "K_glide_raw"] = K_raw
         seg.loc[seg["activity_id"] == aid, "K_glide_soft"] = K_soft
