@@ -10,11 +10,11 @@ import altair as alt
 # Настройки по подразбиране
 # -----------------------------
 T_SEG = 5.0              # дължина на сегмента [s]
-MIN_POINTS_SEG = 2       # минимум точки в сегмента
+MIN_POINTS_SEG = 2       # минимум точки в сегмента (локално, както в стария код)
 MIN_D_SEG = 5.0          # минимум хоризонтална дистанция [m]
 MIN_T_SEG = 3.0          # минимум продължителност [s]
 MAX_ABS_SLOPE = 30.0     # макс. наклон [%]
-V_MAX_KMH = 60.0         # (вече не се ползва като филтър, оставено само за евентуална диагностика)
+V_MAX_KMH = 60.0         # (не се ползва като филтър тук, оставено за диагностика)
 
 DOWN_MIN = -15.0         # долна граница за downhill [%] за Glide модела
 DOWN_MAX = -5.0          # горна граница за downhill [%]
@@ -198,7 +198,7 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
     Връща:
     - segments с добавени колони ['is_downhill','V_glide','K_glide_raw','K_glide_soft']
     - таблица с обобщения по активност
-    - параметри на модела (np.poly1d glide_poly или None)
+    - параметри на глобалния Glide модел (np.poly1d glide_poly или None)
     """
     seg = segments.copy()
     if seg.empty:
@@ -300,8 +300,8 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
                 "V_down_model": V_down_model,
                 "K_glide_raw": K_raw,
                 "K_glide_soft": K_soft,
-                "V_overall_real": V_overall_real_seg,   # временно
-                "V_overall_glide": V_overall_glide_seg, # временно
+                "V_overall_real": V_overall_real_seg,
+                "V_overall_glide": V_overall_glide_seg,
             }
         )
 
@@ -312,20 +312,23 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
 
 
 # --------------------------------------------------------------------------------
-# Модел 2 – Наклон
+# Модел 2 – Наклон (локален по активност)
 # --------------------------------------------------------------------------------
 def compute_slope_model(segments_glide: pd.DataFrame):
     """
-    Изчислява:
-    - V_flat за всяка активност (от |slope|<=1% върху V_glide)
-    - ΔV_real_s = 100 * (V_glide_s - V_flat_A) / V_flat_A
-    - квадратичен модел ΔV_model(slope)
-    - V_final_s = V_glide_s / f_slope(slope)
+    ЛОКАЛЕН ΔV%(slope) модел ПО АКТИВНОСТ.
+
+    За всяка активност A:
+    - определя V_flat,A от сегментите с |slope| <= FLAT_BAND;
+    - смята ΔV_real,S = 100 * (V_glide,S - V_flat,A) / V_flat,A;
+    - обучава локален квадратичен модел ΔV_model,A(s) за s в (SLOPE_MODEL_MIN, SLOPE_MODEL_MAX);
+    - извежда V_final,S = V_glide,S / f_slope,A(s), където f_slope,A(s) = 1 + ΔV_model,A(s)/100.
     """
     seg = segments_glide.copy()
     if seg.empty:
-        return seg, pd.DataFrame(), None
+        return seg, pd.DataFrame(), {}
 
+    # 1) V_flat по активност
     vflat_map = {}
     for aid, g in seg.groupby("activity_id"):
         flat = g[abs(g["slope_pct"]) <= FLAT_BAND]
@@ -337,111 +340,83 @@ def compute_slope_model(segments_glide: pd.DataFrame):
     seg["V_flat_A"] = seg["activity_id"].map(vflat_map)
     seg["DeltaV_real"] = 100.0 * (seg["V_glide"] - seg["V_flat_A"]) / seg["V_flat_A"]
 
-    train = seg[
-        (seg["slope_pct"] > SLOPE_MODEL_MIN)
-        & (seg["slope_pct"] < SLOPE_MODEL_MAX)
-        & seg["V_flat_A"].notna()
-    ].copy()
+    # 2) Локален модел по активност
+    polys = {}  # activity_id -> poly1d или None
 
-    if len(train) < 20:
-        seg["DeltaV_model"] = 0.0
-        seg["V_final"] = seg["V_glide"]
-        summary = (
-            seg.groupby("activity_id")
-            .apply(
-                lambda g: pd.Series(
-                    {
-                        "activity_id": g["activity_id"].iloc[0],
-                        "n_slope_segments": 0,
-                        "mean_slope_model": np.nan,
-                        "mean_DeltaV_real": np.nan,
-                        "V_overall_real": (g["V_kmh"] * g["duration_s"]).sum()
-                        / g["duration_s"].sum(),
-                        "V_overall_glide": (g["V_glide"] * g["duration_s"]).sum()
-                        / g["duration_s"].sum(),
-                        "V_overall_final": (g["V_glide"] * g["duration_s"]).sum()
-                        / g["duration_s"].sum(),
-                    }
-                )
-            )
-            .reset_index(drop=True)
-        )
-        return seg, summary, None
-
-    x = train["slope_pct"].values
-    y = train["DeltaV_real"].values
-    try:
-        coeffs = np.polyfit(x, y, deg=2)
-        slope_poly = np.poly1d(coeffs)
-    except Exception:
-        slope_poly = None
-
-    if slope_poly is None:
-        seg["DeltaV_model"] = 0.0
-        seg["V_final"] = seg["V_glide"]
-        summary = (
-            seg.groupby("activity_id")
-            .apply(
-                lambda g: pd.Series(
-                    {
-                        "activity_id": g["activity_id"].iloc[0],
-                        "n_slope_segments": len(
-                            g[
-                                (g["slope_pct"] > SLOPE_MODEL_MIN)
-                                & (g["slope_pct"] < SLOPE_MODEL_MAX)
-                            ]
-                        ),
-                        "mean_slope_model": np.nan,
-                        "mean_DeltaV_real": np.nan,
-                        "V_overall_real": (g["V_kmh"] * g["duration_s"]).sum()
-                        / g["duration_s"].sum(),
-                        "V_overall_glide": (g["V_glide"] * g["duration_s"]).sum()
-                        / g["duration_s"].sum(),
-                        "V_overall_final": (g["V_glide"] * g["duration_s"]).sum()
-                        / g["duration_s"].sum(),
-                    }
-                )
-            )
-            .reset_index(drop=True)
-        )
-        return seg, summary, None
-
-    seg["DeltaV_model"] = slope_poly(seg["slope_pct"])
-
-    def f_slope(s):
-        s_val = float(s)
-        if abs(s_val) <= FLAT_BAND:
-            return 1.0
-        if s_val <= SLOPE_MODEL_MIN or s_val >= SLOPE_MODEL_MAX:
-            return 1.0
-        dv_model = float(slope_poly(s_val))
-        return 1.0 + dv_model / 100.0
-
-    seg["f_slope"] = seg["slope_pct"].apply(f_slope)
-    seg["V_final"] = seg["V_glide"] / seg["f_slope"]
+    # Инициализации
+    seg["DeltaV_model"] = 0.0
+    seg["f_slope"] = 1.0
+    seg["V_final"] = seg["V_glide"]
 
     activity_rows = []
+
     for aid, g in seg.groupby("activity_id"):
-        g_train = g[
+        V_flat_A = vflat_map[aid]
+
+        # обучаващ набор за тази активност
+        train = g[
             (g["slope_pct"] > SLOPE_MODEL_MIN)
             & (g["slope_pct"] < SLOPE_MODEL_MAX)
-        ]
-        if len(g_train) > 0:
-            w = g_train["duration_s"].values
-            mean_slope_model = np.average(g_train["slope_pct"].values, weights=w)
-            mean_DeltaV_real = np.average(g_train["DeltaV_real"].values, weights=w)
+            & g["V_flat_A"].notna()
+        ].copy()
+
+        if len(train) >= 10:
+            x = train["slope_pct"].values
+            y = train["DeltaV_real"].values
+            try:
+                coeffs = np.polyfit(x, y, deg=2)
+                slope_poly = np.poly1d(coeffs)
+            except Exception:
+                slope_poly = None
+        else:
+            slope_poly = None
+
+        polys[aid] = slope_poly
+
+        # ако има локален модел – прилагаме го
+        idx = g.index
+        if slope_poly is not None:
+            # записваме DeltaV_model за всички сегменти на активността
+            seg.loc[idx, "DeltaV_model"] = slope_poly(g["slope_pct"].values)
+
+            def f_slope_local(s):
+                s_val = float(s)
+                if abs(s_val) <= FLAT_BAND:
+                    return 1.0
+                if s_val <= SLOPE_MODEL_MIN or s_val >= SLOPE_MODEL_MAX:
+                    return 1.0
+                dv_model = float(slope_poly(s_val))
+                return 1.0 + dv_model / 100.0
+
+            seg.loc[idx, "f_slope"] = g["slope_pct"].apply(f_slope_local)
+        else:
+            # няма локален модел → f_slope остава 1.0, DeltaV_model = 0.0
+            seg.loc[idx, "f_slope"] = 1.0
+            seg.loc[idx, "DeltaV_model"] = 0.0
+
+        # обновяваме V_final за активността
+        seg.loc[idx, "V_final"] = seg.loc[idx, "V_glide"] / seg.loc[idx, "f_slope"]
+
+        # Резюме по активност
+        if slope_poly is not None and len(train) > 0:
+            w = train["duration_s"].values
+            mean_slope_model = np.average(train["slope_pct"].values, weights=w)
+            mean_DeltaV_real = np.average(train["DeltaV_real"].values, weights=w)
+            n_slope_segments = len(train)
         else:
             mean_slope_model = np.nan
             mean_DeltaV_real = np.nan
+            n_slope_segments = 0
 
-        V_overall_real_seg = (g["V_kmh"] * g["duration_s"]).sum() / g["duration_s"].sum()
-        V_overall_glide_seg = (g["V_glide"] * g["duration_s"]).sum() / g["duration_s"].sum()
-        V_overall_final_seg = (g["V_final"] * g["duration_s"]).sum() / g["duration_s"].sum()
+        g_all = seg.loc[idx]
+        V_overall_real_seg = (g_all["V_kmh"] * g_all["duration_s"]).sum() / g_all["duration_s"].sum()
+        V_overall_glide_seg = (g_all["V_glide"] * g_all["duration_s"]).sum() / g_all["duration_s"].sum()
+        V_overall_final_seg = (g_all["V_final"] * g_all["duration_s"]).sum() / g_all["duration_s"].sum()
 
         activity_rows.append(
             {
                 "activity_id": aid,
-                "n_slope_segments": len(g_train),
+                "n_slope_segments": n_slope_segments,
                 "mean_slope_model": mean_slope_model,
                 "mean_DeltaV_real": mean_DeltaV_real,
                 "V_overall_real": V_overall_real_seg,
@@ -451,7 +426,7 @@ def compute_slope_model(segments_glide: pd.DataFrame):
         )
 
     summary_df = pd.DataFrame(activity_rows)
-    return seg, summary_df, slope_poly
+    return seg, summary_df, polys
 
 
 # --------------------------------------------------------------------------------
@@ -462,7 +437,7 @@ def assign_zones(df: pd.DataFrame, cs: float, z_bounds: dict, speed_min_zone: fl
     - Зоните се базират на V_final (двойно модулирана скорост).
     - В зоните влизат само сегменти с V_kmh >= speed_min_zone.
     - Спусканията (slope <= -5%) при движение винаги са Z1,
-      като им задаваме фиксирана "Z1 скорост" (средата на диапазона на Z1).
+      като им задаваме фиксирана "Z1 скорост" = горната граница на Z1 (напр. 0.8*CS).
     - Сегментите с V_kmh < speed_min_zone (стрелба/почивки) не влизат в зоните.
     """
     d = df.copy()
@@ -476,15 +451,15 @@ def assign_zones(df: pd.DataFrame, cs: float, z_bounds: dict, speed_min_zone: fl
     down_mask = (d["slope_pct"] <= DOWNHILL_ZONE1_THRESH) & move_mask
     flat_up_mask = (d["slope_pct"] > DOWNHILL_ZONE1_THRESH) & move_mask
 
-    # Z1 – взимаме средата на диапазона
+    # Z1 – ГОРНА граница на диапазона
     z1_lo, z1_hi = z_bounds["Z1"]
-    z1_ratio = 0.5 * (z1_lo + z1_hi)  # например 0.40 => 40% от CS
+    z1_ratio = z1_hi   # напр. 0.80 → 16 km/h при CS=20
 
     d["V_eff"] = np.nan
     d["ratio"] = np.nan
     d["zone"] = None
 
-    # 1) сегменти (без спускания) – V_eff = V_final
+    # 1) сегменти без спускания – V_eff = V_final
     d.loc[flat_up_mask, "V_eff"] = d.loc[flat_up_mask, "V_final"]
     d.loc[flat_up_mask, "ratio"] = d.loc[flat_up_mask, "V_eff"] / cs
 
@@ -496,12 +471,12 @@ def assign_zones(df: pd.DataFrame, cs: float, z_bounds: dict, speed_min_zone: fl
 
     d.loc[flat_up_mask, "zone"] = d.loc[flat_up_mask, "ratio"].apply(get_zone)
 
-    # 2) спускания при движение – фиксирана Z1 скорост (без усилие)
+    # 2) спускания – „без усилие“, но с ratio = горна граница на Z1
     d.loc[down_mask, "ratio"] = z1_ratio
     d.loc[down_mask, "V_eff"] = z1_ratio * cs
     d.loc[down_mask, "zone"] = "Z1"
 
-    # 3) V_kmh < speed_min_zone => zone остава None (излизат от анализа)
+    # 3) много бавни сегменти (стрелба/почивки) не влизат в зоните
     return d
 
 
@@ -770,15 +745,15 @@ else:
         st.info("Няма достатъчно downhill сегменти за визуализация на Glide модела.")
 
 # --------------------------------------------------------------------------------
-# Модел 2 – Наклон
+# Модел 2 – Наклон (локално по активност)
 # --------------------------------------------------------------------------------
 st.markdown("---")
-st.subheader("Модел 2 – Влияние на наклона (ΔV%)")
+st.subheader("Модел 2 – Влияние на наклона (ΔV%) – локален по активност")
 
-segments_slope, slope_summary, slope_poly = compute_slope_model(segments_glide)
+segments_slope, slope_summary, slope_poly_map = compute_slope_model(segments_glide)
 
-if slope_summary.empty:
-    st.warning("Няма достатъчно сегменти за модел на наклона.")
+if slope_summary.empty or slope_summary["n_slope_segments"].sum() == 0:
+    st.warning("Няма достатъчно сегменти за модел на наклона (по активности).")
 else:
     # коефициент на релеф от сегментните средни
     slope_summary["terrain_factor"] = (
@@ -791,17 +766,12 @@ else:
     glide_map = glide_summary.set_index("activity_id")["V_overall_glide"]
     slope_summary["V_overall_glide"] = slope_summary["activity_id"].map(glide_map)
 
-    slope_summary["V_overall_final"] = (
-        slope_summary["V_overall_glide"] * slope_summary["terrain_factor"]
-    )
-
+    # V_overall_final вече е в slope_summary от локалния модел
     st.markdown(
         """
 В този модел за всеки сегмент използваме **V_glide** и го сравняваме със
 **средната скорост при почти равен наклон (-1..+1%) за същата активност**.
-Облакът за модела е от:
-- **наклон [%]**
-- **процентно отклонение ΔV% от V_flat на съответната активност**
+ΔV%(slope) се оценява **локално за всяка активност**, а не глобално.
 """
     )
 
@@ -826,44 +796,62 @@ else:
         )
     )
 
-    train_plot = segments_slope[
-        (segments_slope["slope_pct"] > SLOPE_MODEL_MIN)
-        & (segments_slope["slope_pct"] < SLOPE_MODEL_MAX)
-    ].copy()
+    # Визуализация по избор на активност
+    activities_for_model = [
+        aid for aid in segments_slope["activity_id"].unique()
+        if slope_poly_map.get(aid) is not None
+    ]
 
-    if not train_plot.empty and slope_poly is not None:
-        st.markdown("**Графика: ΔV_real% спрямо наклон + квадратичен модел ΔV_model%**")
-
-        scatter2 = (
-            alt.Chart(train_plot)
-            .mark_circle(size=30, opacity=0.4)
-            .encode(
-                x=alt.X("slope_pct", title="Наклон [%]"),
-                y=alt.Y("DeltaV_real", title="ΔV_real [%]"),
-                color=alt.Color("activity_id", title="Активност"),
-                tooltip=["activity_id", "slope_pct", "DeltaV_real"],
-            )
+    if activities_for_model:
+        selected_slope_activity = st.selectbox(
+            "Избери активност за визуализация на ΔV%(slope) модела",
+            options=activities_for_model,
         )
 
-        x_min2 = float(train_plot["slope_pct"].min())
-        x_max2 = float(train_plot["slope_pct"].max())
-        x_line2 = np.linspace(x_min2, x_max2, 100)
-        y_line2 = slope_poly(x_line2)
-        line2_df = pd.DataFrame({"slope_pct": x_line2, "DeltaV_model": y_line2})
+        poly = slope_poly_map.get(selected_slope_activity, None)
+        train_plot = segments_slope[
+            (segments_slope["activity_id"] == selected_slope_activity)
+            & (segments_slope["slope_pct"] > SLOPE_MODEL_MIN)
+            & (segments_slope["slope_pct"] < SLOPE_MODEL_MAX)
+        ].copy()
 
-        line2 = (
-            alt.Chart(line2_df)
-            .mark_line()
-            .encode(
-                x="slope_pct",
-                y=alt.Y("DeltaV_model", title="ΔV_model [%]"),
-                color=alt.value("black"),
+        if not train_plot.empty and poly is not None:
+            st.markdown(
+                f"**Графика: ΔV_real% спрямо наклон + локален квадратичен модел ΔV_model% за активност {selected_slope_activity}**"
             )
-        )
 
-        st.altair_chart(scatter2 + line2, use_container_width=True)
+            scatter2 = (
+                alt.Chart(train_plot)
+                .mark_circle(size=30, opacity=0.4)
+                .encode(
+                    x=alt.X("slope_pct", title="Наклон [%]"),
+                    y=alt.Y("DeltaV_real", title="ΔV_real [%]"),
+                    color=alt.Color("activity_id", title="Активност"),
+                    tooltip=["activity_id", "slope_pct", "DeltaV_real"],
+                )
+            )
+
+            x_min2 = float(train_plot["slope_pct"].min())
+            x_max2 = float(train_plot["slope_pct"].max())
+            x_line2 = np.linspace(x_min2, x_max2, 100)
+            y_line2 = poly(x_line2)
+            line2_df = pd.DataFrame({"slope_pct": x_line2, "DeltaV_model": y_line2})
+
+            line2 = (
+                alt.Chart(line2_df)
+                .mark_line()
+                .encode(
+                    x="slope_pct",
+                    y=alt.Y("DeltaV_model", title="ΔV_model [%]"),
+                    color=alt.value("black"),
+                )
+            )
+
+            st.altair_chart(scatter2 + line2, use_container_width=True)
+        else:
+            st.info("Няма достатъчно данни за визуализация на локалния ΔV% модел за тази активност.")
     else:
-        st.info("Няма достатъчно данни за визуализация на ΔV% модела.")
+        st.info("Няма нито една активност с достатъчно сегменти за локален ΔV% модел.")
 
 # --------------------------------------------------------------------------------
 # Модел 3 – Зони + пулс
@@ -890,12 +878,12 @@ zones_table = zone_summary(seg_zoned)
 st.markdown(
     """
 Зонирането се прави върху **крайната модулирана скорост** `V_final`  
-(коригирана по плъзгаемост и наклон), приравнена към равен терен
+(коригирана по плъзгаемост и локален наклонов модел), приравнена към равен терен
 и референтна плъзгаемост.
 
 В зоните влизат само движещите се сегменти (V ≥ праг),  
 спусканията със **slope ≤ -5%** при движение се считат за **без усилие** и се
-наливат директно в Z1 с фиксирана ефективна скорост.
+наливат директно в Z1 с ефективна скорост = горната граница на Z1 (напр. 0.8·CS).
 """
 )
 
@@ -924,7 +912,7 @@ if not zones_table.empty:
     st.altair_chart(chart, use_container_width=True)
 
 st.success(
-    "Филтрите от суровите данни са премахнати – сегментите се правят директно от TCX, "
-    "наклонът се смята от първа и последна точка. "
-    "Всички сегменти със slope ≤ -5% при движение влизат директно в Z1."
+    "Моделът за наклон вече е локален по активност (ΔV%(slope) по активност), "
+    "Glide остава глобален с K_glide по активност, "
+    "а зоните се базират на модулирана скорост спрямо CS."
 )
