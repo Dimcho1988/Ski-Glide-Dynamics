@@ -195,11 +195,16 @@ def build_segments(df: pd.DataFrame, activity_id: str, t_seg: float = T_SEG) -> 
 # --------------------------------------------------------------------------------
 def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: int = 2):
     """
-    Модел за плъзгаемост:
-    - Глобален Glide модел V = f(slope) от downhill сегменти
-    - За всяка активност се изчислява K_raw
-    - Прави се "shrink" омекотяване на K_raw към 1.0
-    - След това допълнително омекотяване с alpha_glide и фактор 0.5
+    Модел за плъзгаемост (Glide):
+
+    1) Глобален полином V = f(slope) от downhill сегментите.
+    2) За всяка активност A се изчислява K_raw = V_real_down / V_model_down.
+    3) K_raw се "омекотява" (shrink) към 1.0 за всички стойности:
+       - колкото по-далеч от 1 е K_raw, толкова по-силно се дърпа към 1.
+       - използваме една горна граница high=0.50 за |K_raw-1| ~ 50%, над която
+         го считаме за ненадеждно и го правим 1.0.
+    4) След shrink-а се прилага alpha_glide (0..1):
+       K_soft = 1 + alpha_glide * (K_raw_shrunk - 1).
     """
 
     seg = segments.copy()
@@ -283,35 +288,43 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
             mean_down_V_real = np.average(g_down["V_kmh"].values, weights=w)
             V_down_model = float(glide_poly(mean_down_slope))
 
-            # --- 1) Сурово K_raw
+            # 1) Сурово K_raw
             if V_down_model <= 0:
                 K_raw = 1.0
             else:
                 K_raw = mean_down_V_real / V_down_model
 
-            # --- 2) Твърда защита
+            # 2) Твърда защита срещу напълно абсурдни стойности
+            #    (примерно грешни данни, много малко сегменти и т.н.)
             if (not np.isfinite(K_raw)) or (K_raw <= 0.2) or (K_raw >= 2.0):
                 K_raw = 1.0
             else:
-                # --- 3) Плавно омекотяване (shrink)
+                # 3) Плавен shrink към 1.0 за всички K_raw
                 delta = K_raw - 1.0
-                d0 = 0.2   # праг за омекотяване
-                p = 2.0    # квадратичен контур
-                shrink_factor = 1.0 / (1.0 + (abs(delta) / d0) ** p)
-                delta_shrink = delta * shrink_factor
+                abs_delta = abs(delta)
+
+                high = 0.50  # при |Δ| >= 50% считаме оценката за ненадеждна
+
+                if abs_delta >= high:
+                    # твърде далеч -> дърпаме напълно към 1.0
+                    delta_shrink = 0.0
+                else:
+                    # t от 0 до 1, когато abs_delta расте от 0 до high
+                    t = abs_delta / high          # t ∈ [0,1]
+                    f = 1.0 - t**2                # квадратично затихване: 1 -> 0
+                    delta_shrink = delta * f      # по-далеч -> по-силен shrink
+
                 K_raw = 1.0 + delta_shrink
 
-            # --- 4) Допълнително омекотяване 2x по-слабо
-            factor = 0.5                     # <-- това прави влиянието 2x по-малко
-            alpha_eff = alpha_glide * factor
-            K_soft = 1.0 + alpha_eff * (K_raw - 1.0)
-
+            # 4) Финално омекотяване с alpha_glide (0..1)
+            K_soft = 1.0 + alpha_glide * (K_raw - 1.0)
             n_down = len(g_down)
 
-        # Прилагаме към всички сегменти от тази активност
+        # записваме K_raw и K_soft за всички сегменти от тази активност
         seg.loc[seg["activity_id"] == aid, "K_glide_raw"] = K_raw
         seg.loc[seg["activity_id"] == aid, "K_glide_soft"] = K_soft
 
+        # средни скорости по активност
         V_overall_real_seg = (g["V_kmh"] * g["duration_s"]).sum() / g["duration_s"].sum()
         V_overall_glide_seg = (
             (g["V_kmh"] / K_soft) * g["duration_s"]
