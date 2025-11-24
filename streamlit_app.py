@@ -294,31 +294,23 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
             else:
                 K_raw = mean_down_V_real / V_down_model
 
-            # 2) Твърда защита срещу напълно абсурдни стойности
-            #    (примерно грешни данни, много малко сегменти и т.н.)
-            if (not np.isfinite(K_raw)) or (K_raw <= 0.2) or (K_raw >= 2.0):
-                K_raw = 1.0
-            else:
-                # 3) Плавен shrink към 1.0 за всички K_raw
-                delta = K_raw - 1.0
-                abs_delta = abs(delta)
+            # 2) твърда защита срещу напълно абсурдни стойности
+if (not np.isfinite(K_raw)) or (K_raw <= 0.2) or (K_raw >= 2.0):
+    # твърде екстремно -> не вярваме на оценката
+    K_raw = 1.0
+else:
+    # 3) симетричен shrink към 1.0 за ВСИЧКИ K_raw
+    #    колкото по-голямо е |K_raw - 1|, толкова по-силно го дърпаме
+    delta = K_raw - 1.0
+    d0 = 0.5   # типичен мащаб на отклонението (~50%)
+    p = 2.0    # степен на затихване
 
-                high = 0.50  # при |Δ| >= 50% считаме оценката за ненадеждна
+    shrink_factor = 1.0 / (1.0 + (abs(delta) / d0) ** p)
+    delta_shrink = delta * shrink_factor
+    K_raw = 1.0 + delta_shrink
 
-                if abs_delta >= high:
-                    # твърде далеч -> дърпаме напълно към 1.0
-                    delta_shrink = 0.0
-                else:
-                    # t от 0 до 1, когато abs_delta расте от 0 до high
-                    t = abs_delta / high          # t ∈ [0,1]
-                    f = 1.0 - t**2                # квадратично затихване: 1 -> 0
-                    delta_shrink = delta * f      # по-далеч -> по-силен shrink
-
-                K_raw = 1.0 + delta_shrink
-
-            # 4) Финално омекотяване с alpha_glide (0..1)
-            K_soft = 1.0 + alpha_glide * (K_raw - 1.0)
-            n_down = len(g_down)
+# 4) финално омекотяване с alpha_glide (0..1)
+K_soft = 1.0 + alpha_glide * (K_raw - 1.0)
 
         # записваме K_raw и K_soft за всички сегменти от тази активност
         seg.loc[seg["activity_id"] == aid, "K_glide_raw"] = K_raw
