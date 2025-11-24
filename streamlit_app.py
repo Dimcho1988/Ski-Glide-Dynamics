@@ -191,7 +191,7 @@ def build_segments(df: pd.DataFrame, activity_id: str, t_seg: float = T_SEG) -> 
 
 
 # --------------------------------------------------------------------------------
-# Модел 1 – Плъзгаемост (Glide)
+# Модел 1 – Плъзгаемост (Glide) с омекотяване на K_raw
 # --------------------------------------------------------------------------------
 def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: int = 2):
     """
@@ -199,6 +199,15 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
     - segments с добавени колони ['is_downhill','V_glide','K_glide_raw','K_glide_soft']
     - таблица с обобщения по активност
     - параметри на глобалния Glide модел (np.poly1d glide_poly или None)
+
+    Омекотяване на K_raw:
+    1) твърда защита: ако K_raw е извън [0.2, 2.0] -> K_raw = 1.0
+    2) плавно свиване към 1 с формула:
+       delta = K_raw - 1
+       delta_shrink = delta / (1 + (|delta|/d0)^p), d0=0.2, p=2
+       K_raw_new = 1 + delta_shrink
+    3) след това се прилага alpha_glide:
+       K_soft = 1 + alpha_glide * (K_raw_new - 1)
     """
     seg = segments.copy()
     if seg.empty:
@@ -274,13 +283,26 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
             mean_down_slope = np.average(g_down["slope_pct"].values, weights=w)
             mean_down_V_real = np.average(g_down["V_kmh"].values, weights=w)
             V_down_model = float(glide_poly(mean_down_slope))
+
+            # 1) сурово K_raw
             if V_down_model <= 0:
                 K_raw = 1.0
             else:
                 K_raw = mean_down_V_real / V_down_model
-            # безопасни граници за K_raw
-            if not np.isfinite(K_raw) or K_raw <= 0.3 or K_raw >= 1.7:
+
+            # 2) твърда защита срещу напълно абсурдни стойности
+            if (not np.isfinite(K_raw)) or (K_raw <= 0.2) or (K_raw >= 2.0):
                 K_raw = 1.0
+            else:
+                # 3) плавно омекотяване (shrink) към 1 за по-крайните стойности
+                delta = K_raw - 1.0
+                d0 = 0.2   # праг ~20%
+                p = 2.0    # квадратично затихване
+                shrink_factor = 1.0 / (1.0 + (abs(delta) / d0) ** p)
+                delta_shrink = delta * shrink_factor
+                K_raw = 1.0 + delta_shrink
+
+            # 4) допълнително омекотяване с alpha_glide (0..1)
             K_soft = 1.0 + alpha_glide * (K_raw - 1.0)
             n_down = len(g_down)
 
@@ -938,7 +960,7 @@ if not zones_table.empty:
     st.altair_chart(chart, use_container_width=True)
 
 st.success(
-    "Моделът за наклон вече е глобален ΔV%(slope), "
-    "ΔV_real се нормализира по V_flat за всяка активност, "
-    "а после всички сегменти се използват за един общ полином."
+    "Glide моделът вече има плавно омекотяване на K_raw (shrink към 1), "
+    "освен твърдата защита за напълно абсурдни стойности. "
+    "Наклоновият модел е глобален ΔV%(slope), а зоните са от V_final спрямо CS."
 )
