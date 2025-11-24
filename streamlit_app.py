@@ -265,13 +265,15 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
     except Exception:
         glide_poly = None
 
-    activity_rows = []
+       activity_rows = []
     seg["K_glide_raw"] = 1.0
     seg["K_glide_soft"] = 1.0
 
     for aid, g in seg.groupby("activity_id"):
         g_down = down_df[down_df["activity_id"] == aid]
+
         if glide_poly is None or len(g_down) < 5:
+            # няма надеждни downhill сегменти за тази активност
             K_raw = 1.0
             K_soft = 1.0
             mean_down_slope = np.nan
@@ -279,6 +281,7 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
             V_down_model = np.nan
             n_down = len(g_down)
         else:
+            # времево претеглени средни за тази активност
             w = g_down["duration_s"].values
             mean_down_slope = np.average(g_down["slope_pct"].values, weights=w)
             mean_down_V_real = np.average(g_down["V_kmh"].values, weights=w)
@@ -294,24 +297,27 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
             if (not np.isfinite(K_raw)) or (K_raw <= 0.2) or (K_raw >= 2.0):
                 K_raw = 1.0
             else:
-                # 3) плавно омекотяване (shrink) към 1 за по-крайните стойности
+                # 3) плавно омекотяване (shrink) към 1.0 за по-крайните стойности
                 delta = K_raw - 1.0
-                d0 = 0.2   # праг ~20%
+                d0 = 0.2   # праг ~20% отклонение
                 p = 2.0    # квадратично затихване
                 shrink_factor = 1.0 / (1.0 + (abs(delta) / d0) ** p)
                 delta_shrink = delta * shrink_factor
                 K_raw = 1.0 + delta_shrink
 
-           # 4) допълнително омекотяване с alpha_glide (0..1),
-#    но с 2 пъти по-малко влияние (factor = 0.5)
-factor = 0.5  # тук контролираш "2 пъти по-малко"; можеш да го пипаш ако искаш
-alpha_eff = alpha_glide * factor
-K_soft = 1.0 + alpha_eff * (K_raw - 1.0)
+            # 4) допълнително омекотяване с alpha_glide,
+            #    но с 2 пъти по-малко влияние (factor = 0.5)
+            factor = 0.5
+            alpha_eff = alpha_glide * factor
+            K_soft = 1.0 + alpha_eff * (K_raw - 1.0)
 
+            n_down = len(g_down)
 
+        # записваме K_raw и K_soft за всички сегменти от тази активност
         seg.loc[seg["activity_id"] == aid, "K_glide_raw"] = K_raw
         seg.loc[seg["activity_id"] == aid, "K_glide_soft"] = K_soft
 
+        # средни скорости по активност
         V_overall_real_seg = (g["V_kmh"] * g["duration_s"]).sum() / g["duration_s"].sum()
         V_overall_glide_seg = (
             (g["V_kmh"] / K_soft) * g["duration_s"]
@@ -333,9 +339,7 @@ K_soft = 1.0 + alpha_eff * (K_raw - 1.0)
 
     seg["V_glide"] = seg["V_kmh"] / seg["K_glide_soft"]
     summary_df = pd.DataFrame(activity_rows)
-
     return seg, summary_df, glide_poly
-
 
 # --------------------------------------------------------------------------------
 # Модел 2 – Наклон (ГЛОБАЛЕН ΔV%(slope))
