@@ -379,49 +379,62 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
 # --------------------------------------------------------------------------------
 def compute_slope_model(segments_glide: pd.DataFrame):
     """
-    Глобален ΔV%(slope) модел:
+    Прост полиномен модел за влияние на наклона върху скоростта
+    (след като вече сме коригирали по плъзгаемост – V_glide).
 
-    1) За всяка активност A:
-       - намираме V_flat,A от сегментите с |slope| <= FLAT_BAND;
-       - за всички нейни сегменти смятаме ΔV_real,S = 100 * (V_glide,S - V_flat,A) / V_flat,A.
+    Идея:
+    - За всяка активност A намираме V_flat,A = средна V_glide при почти равен наклон (|slope| <= FLAT_BAND).
+    - За всеки сегмент S с наклон s_S в диапазона (SLOPE_MODEL_MIN, SLOPE_MODEL_MAX) изчисляваме:
+         r_S = V_glide,S / V_flat,A   (относителна скорост спрямо равно)
+    - Събираме всички (s_S, r_S) от всички активности и обучаваме глобален полином:
+         r_model(s) = a0 + a1*s + a2*s^2
+    - Приравняваме към равно:
+         f_slope(s) = 1 / r_model(s)
+         V_final = V_glide * f_slope(s)
 
-    2) Всички (s_S, ΔV_real,S) от всички активности влизат в един общ обучаващ набор
-       за глобален квадратичен модел ΔV_model(s).
-
-       ТУК ДОБАВЯМЕ ДВЕ РОБУСТНИ ОГРАНИЧЕНИЯ:
-       - изключваме сегменти с |ΔV_real| > 40% (outliers)
-       - по-късно клипваме ΔV_model в [-30%, +30%]
-
-    3) За всички сегменти прилагаме V_final,S = V_glide,S / f_slope(s_S),
-       където f_slope(s) = 1 + ΔV_model(s)/100, а f_slope се клипва в [0.7, 1.3].
+    Забележка:
+    - сегментите с slope <= SLOPE_MODEL_MIN (напр. -3%) НЕ се пипат тук (f_slope = 1),
+      те се интерпретират в зонния модел като Z1 със ~70% от CS.
     """
+
     seg = segments_glide.copy()
     if seg.empty:
         return seg, pd.DataFrame(), None
 
-    # 1) V_flat по активност
+    # 1) V_flat по активност (референтна "равна" скорост)
     vflat_map = {}
     for aid, g in seg.groupby("activity_id"):
-        flat = g[abs(g["slope_pct"]) <= FLAT_BAND]
+        flat = g[g["slope_pct"].abs() <= FLAT_BAND]
         if len(flat) < 5:
-            flat = g
-        V_flat = (flat["V_glide"] * flat["duration_s"]).sum() / flat["duration_s"].sum()
-        vflat_map[aid] = V_flat
+            # ако няма достатъчно равни сегменти, използваме всички в модела за наклон
+            flat = g[
+                (g["slope_pct"] > SLOPE_MODEL_MIN)
+                & (g["slope_pct"] < SLOPE_MODEL_MAX)
+            ]
+            if flat.empty:
+                flat = g
+
+        V_flat_A = (flat["V_glide"] * flat["duration_s"]).sum() / flat["duration_s"].sum()
+        vflat_map[aid] = V_flat_A
 
     seg["V_flat_A"] = seg["activity_id"].map(vflat_map)
-    seg["DeltaV_real"] = 100.0 * (seg["V_glide"] - seg["V_flat_A"]) / seg["V_flat_A"]
 
-    # 2) Глобален обучаващ набор за ΔV%(slope)
+    # Относителна скорост спрямо равно: r = V_glide / V_flat_A
+    seg["r_rel"] = seg["V_glide"] / seg["V_flat_A"]
+
+    # 2) Обучаващ набор: само сегменти с наклон между SLOPE_MODEL_MIN и SLOPE_MODEL_MAX
     train = seg[
         (seg["slope_pct"] > SLOPE_MODEL_MIN)
         & (seg["slope_pct"] < SLOPE_MODEL_MAX)
         & seg["V_flat_A"].notna()
+        & np.isfinite(seg["r_rel"])
     ].copy()
 
-    # --- НОВО: махаме очевидни outliers по ΔV_real ---
-    train = train[train["DeltaV_real"].between(-40.0, 40.0)]
+    # махаме очевидни аутлайери (примерно r_rel < 0.4 или > 1.6)
+    train = train[(train["r_rel"] >= 0.4) & (train["r_rel"] <= 1.6)]
 
     if len(train) < 20:
+        # недостатъчно данни → не коригираме по наклон
         seg["DeltaV_model"] = 0.0
         seg["f_slope"] = 1.0
         seg["V_final"] = seg["V_glide"]
@@ -447,8 +460,9 @@ def compute_slope_model(segments_glide: pd.DataFrame):
         )
         return seg, summary, None
 
+    # 3) Полином r_model(s) върху всички активности
     x = train["slope_pct"].values
-    y = train["DeltaV_real"].values
+    y = train["r_rel"].values
     try:
         coeffs = np.polyfit(x, y, deg=2)
         slope_poly = np.poly1d(coeffs)
@@ -486,27 +500,36 @@ def compute_slope_model(segments_glide: pd.DataFrame):
         )
         return seg, summary, None
 
-    # 3) Прилагаме глобалния модел + клипове
-    def f_slope(s):
+    # 4) Прилагаме модела: f_slope = 1 / r_model(s)
+    def f_slope_func(s):
         s_val = float(s)
+
+        # големи спускания – под SLOPE_MODEL_MIN (напр. -3%) не пипаме
+        if s_val <= SLOPE_MODEL_MIN:
+            return 1.0
+
+        # почти равно – без корекция
         if abs(s_val) <= FLAT_BAND:
             return 1.0
-        if s_val <= SLOPE_MODEL_MIN or s_val >= SLOPE_MODEL_MAX:
+
+        # извън горната граница на модела – без корекция
+        if s_val >= SLOPE_MODEL_MAX:
             return 1.0
-        dv_model = float(slope_poly(s_val))
 
-        # --- НОВО: ограничаваме модела в разумен диапазон ---
-        dv_model = max(min(dv_model, 30.0), -30.0)   # ΔV_model ∈ [-30%, +30%]
+        r_model = float(slope_poly(s_val))
 
-        f = 1.0 + dv_model / 100.0
-        f = max(min(f, 1.3), 0.7)                    # f_slope ∈ [0.7, 1.3]
+        # ограничаваме r_model, за да няма безумия
+        r_model = float(np.clip(r_model, 0.5, 1.3))  # 50%–130% от равното
+        f = 1.0 / r_model
+        f = float(np.clip(f, 0.7, 1.5))             # не повече от ~±50% корекция
+
         return f
 
-    seg["DeltaV_model"] = slope_poly(seg["slope_pct"])
-    seg["f_slope"] = seg["slope_pct"].apply(f_slope)
-    seg["V_final"] = seg["V_glide"] / seg["f_slope"]
+    seg["DeltaV_model"] = 100.0 * (seg["r_rel"] - 1.0)  # просто информативно
+    seg["f_slope"] = seg["slope_pct"].apply(f_slope_func)
+    seg["V_final"] = seg["V_glide"] * seg["f_slope"]
 
-    # 4) Обобщение по активност
+    # 5) Обобщение по активност
     activity_rows = []
     for aid, g in seg.groupby("activity_id"):
         g_train = g[
@@ -516,7 +539,9 @@ def compute_slope_model(segments_glide: pd.DataFrame):
         if len(g_train) > 0:
             w = g_train["duration_s"].values
             mean_slope_model = np.average(g_train["slope_pct"].values, weights=w)
-            mean_DeltaV_real = np.average(g_train["DeltaV_real"].values, weights=w)
+            mean_DeltaV_real = np.average(
+                100.0 * (g_train["r_rel"] - 1.0), weights=w
+            )
             n_slope_segments = len(g_train)
         else:
             mean_slope_model = np.nan
@@ -541,6 +566,7 @@ def compute_slope_model(segments_glide: pd.DataFrame):
 
     summary_df = pd.DataFrame(activity_rows)
     return seg, summary_df, slope_poly
+
 
 # --------------------------------------------------------------------------------
 # Модел 3 – Зони + пулс
