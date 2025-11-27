@@ -197,29 +197,26 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
     """
     Модел за плъзгаемост (Glide):
 
-    1) Глобален полином V = f(slope) върху downhill сегментите (между DOWN_MIN и DOWN_MAX,
-       и предхождани от downhill сегмент).
+    1) От всички downhill сегменти (между DOWN_MIN и DOWN_MAX и предхождани от downhill)
+       се строи глобален полином V = poly(slope).
 
     2) За всяка активност A:
        - намираме среден наклон на downhill сегментите: s̄_A
-       - намираме средна реална скорост върху тези сегменти: V̄_real,A
-       - моделна скорост: V_model,A = poly(s̄_A)
-       - суров коефициент: K_raw = V̄_real,A / V_model,A
+       - намираме средна реална скорост върху тях: V̄_real,A
+       - моделна скорост: V_down_model = poly(s̄_A)
+       - суров коефициент: K_raw = V̄_real,A / V_down_model
 
-    3) Груба защита от тотални грешки:
-       ако K_raw не е число, или K_raw <= 0.2, или K_raw >= 2.0 → K_raw = 1.0
+    3) Груба защита:
+       ако K_raw не е число или е извън [0.2, 2.0] -> K_raw = 1.0
 
-    4) Омекотяване САМО в опашките на камбаната:
-       - ако 0.70 <= K_raw <= 1.10 → оставяме го както е
-       - ако K_raw < 0.70 или K_raw > 1.10:
-           Δ = K_raw - 1.0
-           Δ ← Δ * EXT_FACTOR (напр. 0.5 → 2x по-малко влияние)
-           K_raw_new = 1 + Δ
+    4) Асиметрично, плавно омекотяване на Δ = K_raw - 1 чрез soften_delta_asym:
+       - при бързи ски (Δ>0): крайности над +15%, със старт на омекотяване при +10%
+       - при бавни ски (Δ<0): крайности под -30%, със старт на омекотяване при -20%
 
-    5) Прилагаме финално омекотяване чрез alpha_glide:
-       K_soft = 1 + alpha_glide * (K_raw - 1)
+    5) Alpha_glide контролира силата на ефекта:
+       K_soft = 1 + alpha_glide * (K_mod - 1)
 
-    6) За всички сегменти на активността:
+    6) V_glide за всеки сегмент:
        V_glide = V_kmh / K_soft
     """
 
@@ -229,7 +226,7 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
 
     seg = seg.sort_values(["activity_id", "seg_id"]).reset_index(drop=True)
 
-    # ==== 1) Определяне на downhill сегменти ====
+    # ---- 1) Маркиране на downhill сегментите ----
     seg["is_downhill"] = (seg["slope_pct"] >= DOWN_MIN) & (seg["slope_pct"] <= DOWN_MAX)
 
     seg["is_prev_downhill"] = False
@@ -241,7 +238,7 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
     downhill_mask = seg["is_downhill"] & seg["is_prev_downhill"]
     down_df = seg.loc[downhill_mask].copy()
 
-    # Недостатъчно downhill → без модел
+    # Ако няма достатъчно downhill сегменти → не правим Glide модел
     if len(down_df) < 20:
         seg["K_glide_raw"] = 1.0
         seg["K_glide_soft"] = 1.0
@@ -270,7 +267,7 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
         )
         return seg, summary, None
 
-    # ==== 2) Глобален Glide модел: V = poly(slope) ====
+    # ---- 2) Глобален полином V = poly(slope) върху downhill сегментите ----
     x = down_df["slope_pct"].values
     y = down_df["V_kmh"].values
     try:
@@ -279,21 +276,17 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
     except Exception:
         glide_poly = None
 
-    # ==== 3) K_raw по активност + омекотяване в опашките ====
+    # ---- 3) Изчисляване на K_raw по активност + омекотяване ----
     activity_rows = []
     seg["K_glide_raw"] = 1.0
     seg["K_glide_soft"] = 1.0
-
-    # Параметри за опашките
-    LOW_EXTREME = 0.70   # под това: супер "бавни" ски
-    HIGH_EXTREME = 1.10  # над това: супер "бързи" ски
-    EXT_FACTOR = 0.5     # намаляване на отклонението 2x
 
     for aid, g in seg.groupby("activity_id"):
 
         g_down = down_df[down_df["activity_id"] == aid]
 
         if glide_poly is None or len(g_down) < 5:
+            # Нямаме стабилен модел за тази активност
             K_raw = 1.0
             K_soft = 1.0
             mean_down_slope = np.nan
@@ -301,7 +294,7 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
             V_down_model = np.nan
             n_down = len(g_down)
         else:
-            # Средни стойности
+            # Средни стойности за downhill сегментите на активността
             w = g_down["duration_s"].values
             mean_down_slope = np.average(g_down["slope_pct"].values, weights=w)
             mean_down_V_real = np.average(g_down["V_kmh"].values, weights=w)
@@ -313,24 +306,20 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
             else:
                 K_raw = mean_down_V_real / V_down_model
 
-            # --- Груба защита от напълно грешни стойности ---
+            # --- Груба защита от напълно счупени стойности ---
             if (not np.isfinite(K_raw)) or (K_raw <= 0.2) or (K_raw >= 2.0):
                 K_raw = 1.0
             else:
-                # --- Омекотяване само за крайните стойности ---
+                # Асиметрично, плавно омекотяване на Δ = K_raw - 1
                 delta = K_raw - 1.0
-
-                if K_raw < LOW_EXTREME or K_raw > HIGH_EXTREME:
-                    # режем влиянието (по-мека оценка на супер бавни/супер бързи ски)
-                    delta *= EXT_FACTOR
-
-                K_raw = 1.0 + delta
+                delta_soft = soften_delta_asym(delta)
+                K_raw = 1.0 + delta_soft
 
             # --- Финално омекотяване (alpha_glide) ---
             K_soft = 1.0 + alpha_glide * (K_raw - 1.0)
             n_down = len(g_down)
 
-        # прилагаме K към сегментите от тази активност
+        # Записваме коефициентите в сегментите на тази активност
         seg.loc[seg["activity_id"] == aid, "K_glide_raw"] = K_raw
         seg.loc[seg["activity_id"] == aid, "K_glide_soft"] = K_soft
 
@@ -352,11 +341,11 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
             }
         )
 
+    # Крайна glide-скорост за всеки сегмент
     seg["V_glide"] = seg["V_kmh"] / seg["K_glide_soft"]
     summary_df = pd.DataFrame(activity_rows)
 
     return seg, summary_df, glide_poly
-
 
 # --------------------------------------------------------------------------------
 # Модел 2 – Наклон (ГЛОБАЛЕН ΔV%(slope))
