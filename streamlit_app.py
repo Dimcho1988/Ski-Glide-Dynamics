@@ -388,9 +388,12 @@ def compute_slope_model(segments_glide: pd.DataFrame):
     2) Всички (s_S, ΔV_real,S) от всички активности влизат в един общ обучаващ набор
        за глобален квадратичен модел ΔV_model(s).
 
+       ТУК ДОБАВЯМЕ ДВЕ РОБУСТНИ ОГРАНИЧЕНИЯ:
+       - изключваме сегменти с |ΔV_real| > 40% (outliers)
+       - по-късно клипваме ΔV_model в [-30%, +30%]
+
     3) За всички сегменти прилагаме V_final,S = V_glide,S / f_slope(s_S),
-       където f_slope(s) = 1 + ΔV_model(s)/100 в диапазона (SLOPE_MODEL_MIN, SLOPE_MODEL_MAX),
-       а извън него f_slope = 1.
+       където f_slope(s) = 1 + ΔV_model(s)/100, а f_slope се клипва в [0.7, 1.3].
     """
     seg = segments_glide.copy()
     if seg.empty:
@@ -414,6 +417,9 @@ def compute_slope_model(segments_glide: pd.DataFrame):
         & (seg["slope_pct"] < SLOPE_MODEL_MAX)
         & seg["V_flat_A"].notna()
     ].copy()
+
+    # --- НОВО: махаме очевидни outliers по ΔV_real ---
+    train = train[train["DeltaV_real"].between(-40.0, 40.0)]
 
     if len(train) < 20:
         seg["DeltaV_model"] = 0.0
@@ -449,7 +455,6 @@ def compute_slope_model(segments_glide: pd.DataFrame):
     except Exception:
         slope_poly = None
 
-    # Ако няма стабилен полином
     if slope_poly is None:
         seg["DeltaV_model"] = 0.0
         seg["f_slope"] = 1.0
@@ -481,9 +486,7 @@ def compute_slope_model(segments_glide: pd.DataFrame):
         )
         return seg, summary, None
 
-    # 3) Прилагаме глобалния модел
-    seg["DeltaV_model"] = slope_poly(seg["slope_pct"])
-
+    # 3) Прилагаме глобалния модел + клипове
     def f_slope(s):
         s_val = float(s)
         if abs(s_val) <= FLAT_BAND:
@@ -491,8 +494,15 @@ def compute_slope_model(segments_glide: pd.DataFrame):
         if s_val <= SLOPE_MODEL_MIN or s_val >= SLOPE_MODEL_MAX:
             return 1.0
         dv_model = float(slope_poly(s_val))
-        return 1.0 + dv_model / 100.0
 
+        # --- НОВО: ограничаваме модела в разумен диапазон ---
+        dv_model = max(min(dv_model, 30.0), -30.0)   # ΔV_model ∈ [-30%, +30%]
+
+        f = 1.0 + dv_model / 100.0
+        f = max(min(f, 1.3), 0.7)                    # f_slope ∈ [0.7, 1.3]
+        return f
+
+    seg["DeltaV_model"] = slope_poly(seg["slope_pct"])
     seg["f_slope"] = seg["slope_pct"].apply(f_slope)
     seg["V_final"] = seg["V_glide"] / seg["f_slope"]
 
@@ -531,7 +541,6 @@ def compute_slope_model(segments_glide: pd.DataFrame):
 
     summary_df = pd.DataFrame(activity_rows)
     return seg, summary_df, slope_poly
-
 
 # --------------------------------------------------------------------------------
 # Модел 3 – Зони + пулс
