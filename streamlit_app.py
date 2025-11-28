@@ -8,7 +8,7 @@ import math
 import altair as alt
 
 # ---------------------------------------------------------
-# НАСТРОЙКИ ПО ПОДРАЗБИРАНЕ
+# НАСТРОЙКИ ПО ПОДРАЗБИРАНЕ (ще се презапишат от sidebar)
 # ---------------------------------------------------------
 T_SEG = 7.0            # дължина на сегмента [s]
 MIN_D_SEG = 5.0        # минимум хоризонтална дистанция [m]
@@ -17,8 +17,9 @@ MAX_ABS_SLOPE = 30.0   # макс. наклон [%]
 V_JUMP_KMH = 15.0      # праг за "скачане" на скоростта между сегменти
 V_JUMP_MIN = 20.0      # гледаме спайкове само над тази скорост [km/h]
 
-GLIDE_POLY_DEG = 2     # степен на полинома за плъзгаемост
-SLOPE_POLY_DEG = 2     # степен на полинома за наклон
+GLIDE_POLY_DEG = 2     # степен на полинома за плъзгаемост (1 или 2)
+SLOPE_POLY_DEG = 2     # степен на полинома за наклон (1 или 2)
+DAMP_GLIDE = 1.0       # омекотяване на коефициента на плъзгаемост (0–1)
 
 # 6-зонна система като % от критичната скорост
 ZONE_BOUNDS = [0.0, 0.75, 0.85, 0.95, 1.05, 1.15, np.inf]
@@ -253,6 +254,9 @@ def fit_glide_poly(train_df):
 
 
 def compute_glide_coefficients(seg, glide_poly):
+    """
+    Връща dict activity -> K_glide (вече омекотен с DAMP_GLIDE).
+    """
     train = get_glide_training_segments(seg)
     if glide_poly is None or train.empty:
         return {}
@@ -266,7 +270,9 @@ def compute_glide_coefficients(seg, glide_poly):
         v_model = float(glide_poly(s_mean))
         if v_model <= 0:
             continue
-        coeffs[act] = v_model / v_real
+        k_raw = v_model / v_real          # пълният коефициент
+        k_damped = 1.0 + DAMP_GLIDE * (k_raw - 1.0)  # омекотен
+        coeffs[act] = k_damped
     return coeffs
 
 
@@ -405,18 +411,20 @@ def summarize_full(seg_glide, seg_slope):
 
     df2 = seg_slope[seg_slope["valid_basic"]].copy()
     if df2.empty:
+        g1["v_glide_mean2"] = np.nan
         g1["v_flat_mean"] = np.nan
         g1["K_slope_eff"] = np.nan
         g1["K_total"] = np.nan
         return g1
 
     g2 = df2.groupby("activity").agg(
-        v_glide_mean=("v_glide", "mean"),
-        v_flat_mean=("v_flat_eq", "mean")
+        v_glide_mean2=("v_glide", "mean"),
+        v_flat_mean=("v_flat_eq", "mean"),
     ).reset_index()
 
     out = pd.merge(g1, g2, on="activity", how="left")
-    out["K_slope_eff"] = out["v_flat_mean"] / out["v_glide_mean"]
+
+    out["K_slope_eff"] = out["v_flat_mean"] / out["v_glide_mean2"]
     out["K_total"] = out["v_flat_mean"] / out["v_real_mean"]
     return out
 
@@ -428,10 +436,39 @@ st.set_page_config(page_title="Ski Glide & Slope Model", layout="wide")
 st.title("Модел за плъзгаемост и наклон – от нулата")
 
 st.sidebar.header("Настройки")
+
+# Критична скорост
 V_crit_input = st.sidebar.number_input(
     "Критична скорост V_crit [km/h]",
     min_value=0.0, max_value=60.0, value=20.0, step=0.5
 )
+
+# Степен на полиномите
+glide_deg = st.sidebar.selectbox(
+    "Степен на полинома за плъзгаемост",
+    options=[1, 2],
+    index=1
+)
+slope_deg = st.sidebar.selectbox(
+    "Степен на полинома за наклон",
+    options=[1, 2],
+    index=1
+)
+
+# Омекотяване на коефициента по плъзгаемост
+glide_damp = st.sidebar.slider(
+    "Омекотяване на коефициента на плъзгаемост (α)",
+    min_value=0.0,
+    max_value=1.0,
+    value=1.0,
+    step=0.05,
+    help="α=1 – пълен ефект, α=0 – без корекция по плъзгаемост"
+)
+
+# презаписваме глобалните настройки
+GLIDE_POLY_DEG = glide_deg
+SLOPE_POLY_DEG = slope_deg
+DAMP_GLIDE = glide_damp
 
 uploaded_files = st.file_uploader(
     "Качи един или няколко TCX файла:",
@@ -498,9 +535,9 @@ if glide_poly is None:
     glide_coeffs = {}
     seg_glide = apply_glide_modulation(segments_f, glide_coeffs)
 else:
-    st.write("Коефициенти на полинома за плъзгаемост (V = f(slope)):", glide_poly.coefficients)
+    st.write(f"Полином за плъзгаемост (степен {GLIDE_POLY_DEG}), коефициенти:", glide_poly.coefficients)
     glide_coeffs = compute_glide_coefficients(segments_f, glide_poly)
-    st.write("Коефициенти на плъзгаемост по активност:", glide_coeffs)
+    st.write("Коефициенти на плъзгаемост по активност (след омекотяване):", glide_coeffs)
     seg_glide = apply_glide_modulation(segments_f, glide_coeffs)
 
     # визуализация на модела
@@ -550,7 +587,7 @@ if slope_poly is None:
     st.warning("Не успях да фитна полином за наклона (твърде малко данни). v_flat_eq = v_glide.")
     seg_slope = apply_slope_modulation(seg_glide, None, V_crit_input)
 else:
-    st.write("Коефициенти на полинома за наклон (F = g(slope)):", slope_poly.coefficients)
+    st.write(f"Полином за наклон (степен {SLOPE_POLY_DEG}), коефициенти:", slope_poly.coefficients)
     # визуализация F(slope)
     if not slope_train.empty:
         s_min2 = slope_train["slope_pct"].min()
@@ -629,4 +666,3 @@ st.download_button(
     file_name="segments_glide_slope_zones.csv",
     mime="text/csv"
 )
-
