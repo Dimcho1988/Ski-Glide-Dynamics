@@ -255,7 +255,7 @@ def fit_glide_poly(train_df):
 
 def compute_glide_coefficients(seg, glide_poly):
     """
-    Връща dict activity -> K_glide (вече омекотен с DAMP_GLIDE).
+    Връща dict activity -> K_glide (омекотен с DAMP_GLIDE и ограничен в [0.85, 1.40]).
     """
     train = get_glide_training_segments(seg)
     if glide_poly is None or train.empty:
@@ -270,11 +270,20 @@ def compute_glide_coefficients(seg, glide_poly):
         v_model = float(glide_poly(s_mean))
         if v_model <= 0:
             continue
-        k_raw = v_model / v_real          # пълният коефициент
-        k_damped = 1.0 + DAMP_GLIDE * (k_raw - 1.0)  # омекотен
-        coeffs[act] = k_damped
-    return coeffs
 
+        # 1) „истински“ коефициент от модела
+        k_raw = v_model / v_real
+
+        # 2) омекотяване (α = DAMP_GLIDE, 0–1)
+        k_damped = 1.0 + DAMP_GLIDE * (k_raw - 1.0)
+
+        # 3) ограничение за плъзгаемостта
+        #    не по-бавно от 0.85 и не по-бързо от 1.40
+        k_limited = max(0.85, min(1.40, k_damped))
+
+        coeffs[act] = k_limited
+
+    return coeffs
 
 def apply_glide_modulation(seg, glide_coeffs):
     seg = seg.copy()
