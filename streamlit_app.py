@@ -315,6 +315,9 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
 # --------------------------------------------------------------------------------
 # Модел 2 – Наклон (ГЛОБАЛЕН ΔV%(slope), ПО СЕГМЕНТИ)
 # --------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------
+# Модел 2 – Наклон (ГЛОБАЛЕН ΔV%(slope), ПО СЕГМЕНТИ)
+# --------------------------------------------------------------------------------
 def compute_slope_model(
     segments_glide: pd.DataFrame,
     alpha_slope: float = 0.5,
@@ -337,8 +340,7 @@ def compute_slope_model(
        - ако сегментът е извън диапазона на модела (s <= SLOPE_MODEL_MIN,
          s >= SLOPE_MODEL_MAX или |s| <= FLAT_BAND) → ΔV_model = 0.
        Получаваме:
-         f_poly(s) = 1 + ΔV_model/100
-         coef_slope(s) = 1 / f_poly(s)
+         coef_slope(s) = 1 - ΔV_model/100
          V_final = V_glide * coef_slope(s)
     """
     seg = segments_glide.copy()
@@ -365,11 +367,12 @@ def compute_slope_model(
     ].copy()
 
     if len(train) < 20:
+        # fallback – няма достатъчно данни за наклонов модел
         seg["DeltaV_model_raw"] = 0.0
         seg["DeltaV_model"] = 0.0
-        seg["f_poly"] = 1.0
         seg["coef_slope"] = 1.0
         seg["V_final"] = seg["V_glide"]
+
         summary = (
             seg.groupby("activity_id")
             .apply(
@@ -404,9 +407,9 @@ def compute_slope_model(
     if slope_poly is None:
         seg["DeltaV_model_raw"] = 0.0
         seg["DeltaV_model"] = 0.0
-        seg["f_poly"] = 1.0
         seg["coef_slope"] = 1.0
         seg["V_final"] = seg["V_glide"]
+
         summary = (
             seg.groupby("activity_id")
             .apply(
@@ -440,7 +443,7 @@ def compute_slope_model(
     # омекотяване
     seg["DeltaV_model"] = alpha_slope * seg["DeltaV_model_raw"]
 
-    # извън диапазона на модела -> без корекция
+    # извън диапазона на модела или около равно -> без корекция
     outside_mask = (
         (seg["slope_pct"] <= SLOPE_MODEL_MIN)
         | (seg["slope_pct"] >= SLOPE_MODEL_MAX)
@@ -448,19 +451,18 @@ def compute_slope_model(
     )
     seg.loc[outside_mask, "DeltaV_model"] = 0.0
 
-    # клипване
+    # клипване в безопасен диапазон
     seg["DeltaV_model"] = seg["DeltaV_model"].clip(-dv_clip, dv_clip)
 
-    # forward множител (как се променя скоростта при този наклон)
-    seg["f_poly"] = 1.0 + seg["DeltaV_model"] / 100.0
+    # КОЕФИЦИЕНТ ПО СЕГМЕНТИ (както го описваш):
+    # ако ΔV_model = -25% (изкачване, по-бавно от равно) → coef = 1 - (-0.25) = 1.25
+    # ако ΔV_model = +25% (спускане, по-бързо от равно) → coef = 1 - 0.25   = 0.75
+    seg["coef_slope"] = 1.0 - seg["DeltaV_model"] / 100.0
 
-    # защита да не делим на нула
-    seg.loc[seg["f_poly"] <= 0.1, "f_poly"] = 0.1
+    # защита – да не стане 0 или отрицателно
+    seg.loc[seg["coef_slope"] < 0.2, "coef_slope"] = 0.2
 
-    # коефициент за приравняване към равно (точно това, което искаш – умножаваме по него)
-    seg["coef_slope"] = 1.0 / seg["f_poly"]
-
-    # крайна скорост на равен терен (вече коригирана за Glide + наклон)
+    # крайна скорост: V_glide, модулирана по наклон
     seg["V_final"] = seg["V_glide"] * seg["coef_slope"]
 
     # 4) Обобщение по активност
@@ -498,7 +500,6 @@ def compute_slope_model(
 
     summary_df = pd.DataFrame(activity_rows)
     return seg, summary_df, slope_poly
-
 
 # --------------------------------------------------------------------------------
 # Модел 3 – Зони + пулс
