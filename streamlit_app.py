@@ -274,8 +274,8 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
                     "V_down_model": np.nan,
                     "K_glide_raw": 1.0,
                     "K_glide_soft": 1.0,
-                    "V_overall_real": V_overall_real,
-                    "V_overall_glide": V_overall_glide,
+                    "V_overall_real_seg": V_overall_real,
+                    "V_overall_glide_seg": V_overall_glide,
                 }
             )
 
@@ -335,7 +335,7 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
     # изчисляваме V_glide за всички сегменти
     seg["V_glide"] = seg["V_kmh"] / seg["K_glide_soft"]
 
-    # обобщение по активност (всичко на база сегменти, не на сурови trackpoint-и)
+    # обобщение по активност (на сегментно ниво, като вътрешна метрика)
     for aid, g in seg.groupby("activity_id"):
         w = g["duration_s"].values
         if w.sum() <= 0:
@@ -370,8 +370,8 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
                 "V_down_model": V_down_model,
                 "K_glide_raw": K_raw,
                 "K_glide_soft": K_soft,
-                "V_overall_real": V_overall_real,
-                "V_overall_glide": V_overall_glide,
+                "V_overall_real_seg": V_overall_real,
+                "V_overall_glide_seg": V_overall_glide,
             }
         )
 
@@ -440,9 +440,9 @@ def compute_slope_model(segments_glide: pd.DataFrame):
             w = g["duration_s"].values
             if w.sum() <= 0:
                 continue
-            V_overall_real = (g["V_kmh"] * w).sum() / w.sum()
-            V_overall_glide = (g["V_glide"] * w).sum() / w.sum()
-            V_overall_final = (g["V_final"] * w).sum() / w.sum()
+            V_overall_real_seg = (g["V_kmh"] * w).sum() / w.sum()
+            V_overall_glide_seg = (g["V_glide"] * w).sum() / w.sum()
+            V_overall_final_seg = (g["V_final"] * w).sum() / w.sum()
 
             g_train = g[
                 (g["slope_pct"] > SLOPE_MODEL_MIN)
@@ -464,9 +464,9 @@ def compute_slope_model(segments_glide: pd.DataFrame):
                     "n_slope_segments": n_slope_segments,
                     "mean_slope_model": mean_slope_model,
                     "mean_DeltaV_real": mean_DeltaV_real,
-                    "V_overall_real": V_overall_real,
-                    "V_overall_glide": V_overall_glide,
-                    "V_overall_final": V_overall_final,
+                    "V_overall_real_seg": V_overall_real_seg,
+                    "V_overall_glide_seg": V_overall_glide_seg,
+                    "V_overall_final": V_overall_final_seg,
                 }
             )
 
@@ -493,9 +493,9 @@ def compute_slope_model(segments_glide: pd.DataFrame):
             w = g["duration_s"].values
             if w.sum() <= 0:
                 continue
-            V_overall_real = (g["V_kmh"] * w).sum() / w.sum()
-            V_overall_glide = (g["V_glide"] * w).sum() / w.sum()
-            V_overall_final = (g["V_final"] * w).sum() / w.sum()
+            V_overall_real_seg = (g["V_kmh"] * w).sum() / w.sum()
+            V_overall_glide_seg = (g["V_glide"] * w).sum() / w.sum()
+            V_overall_final_seg = (g["V_final"] * w).sum() / w.sum()
 
             g_train = g[
                 (g["slope_pct"] > SLOPE_MODEL_MIN)
@@ -517,9 +517,9 @@ def compute_slope_model(segments_glide: pd.DataFrame):
                     "n_slope_segments": n_slope_segments,
                     "mean_slope_model": mean_slope_model,
                     "mean_DeltaV_real": mean_DeltaV_real,
-                    "V_overall_real": V_overall_real,
-                    "V_overall_glide": V_overall_glide,
-                    "V_overall_final": V_overall_final,
+                    "V_overall_real_seg": V_overall_real_seg,
+                    "V_overall_glide_seg": V_overall_glide_seg,
+                    "V_overall_final": V_overall_final_seg,
                 }
             )
 
@@ -623,9 +623,9 @@ def compute_slope_model(segments_glide: pd.DataFrame):
         w = g["duration_s"].values
         if w.sum() <= 0:
             continue
-        V_overall_real = (g["V_kmh"] * w).sum() / w.sum()
-        V_overall_glide = (g["V_glide"] * w).sum() / w.sum()
-        V_overall_final = (g["V_final"] * w).sum() / w.sum()
+        V_overall_real_seg = (g["V_kmh"] * w).sum() / w.sum()
+        V_overall_glide_seg = (g["V_glide"] * w).sum() / w.sum()
+        V_overall_final_seg = (g["V_final"] * w).sum() / w.sum()
 
         activity_rows.append(
             {
@@ -633,9 +633,9 @@ def compute_slope_model(segments_glide: pd.DataFrame):
                 "n_slope_segments": n_slope_segments,
                 "mean_slope_model": mean_slope_model,
                 "mean_DeltaV_real": mean_DeltaV_real,
-                "V_overall_real": V_overall_real,
-                "V_overall_glide": V_overall_glide,
-                "V_overall_final": V_overall_final,
+                "V_overall_real_seg": V_overall_real_seg,
+                "V_overall_glide_seg": V_overall_glide_seg,
+                "V_overall_final": V_overall_final_seg,
             }
         )
 
@@ -869,6 +869,13 @@ segments_glide, glide_summary, glide_poly = compute_glide_model(
 if glide_summary.empty:
     st.warning("Няма достатъчно downhill сегменти за модел на плъзгаемостта.")
 else:
+    # подравняваме V_overall_real с истинските сурови стойности
+    real_map = info_df.set_index("activity_id")["V_overall_real"]
+    glide_summary["V_overall_real"] = glide_summary["activity_id"].map(real_map)
+    glide_summary["V_overall_glide"] = (
+        glide_summary["V_overall_real"] / glide_summary["K_glide_soft"]
+    )
+
     st.dataframe(
         glide_summary[
             [
@@ -938,9 +945,16 @@ segments_slope, slope_summary, slope_poly = compute_slope_model(segments_glide)
 if slope_summary.empty or slope_summary["n_slope_segments"].sum() == 0:
     st.warning("Няма достатъчно сегменти за модел на наклона.")
 else:
-    # Тук V_overall_glide в slope_summary вече е сметнато на сегментно ниво
+    # за показване: V_overall_real от суровите данни, V_overall_glide от Glide
+    real_map = info_df.set_index("activity_id")["V_overall_real"]
+    glide_map = glide_summary.set_index("activity_id")["V_overall_glide"]
+
+    display_df = slope_summary.copy()
+    display_df["V_overall_real"] = display_df["activity_id"].map(real_map)
+    display_df["V_overall_glide"] = display_df["activity_id"].map(glide_map)
+
     st.dataframe(
-        slope_summary[
+        display_df[
             [
                 "activity_id",
                 "n_slope_segments",
