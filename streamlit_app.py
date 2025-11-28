@@ -13,7 +13,7 @@ import altair as alt
 T_SEG = 7.0            # дължина на сегмента [s]
 MIN_D_SEG = 5.0        # минимум хоризонтална дистанция [m]
 MIN_T_SEG = 4.0        # минимум продължителност [s]
-MAX_ABS_SLOPE = 15.0   # макс. наклон [%]
+MAX_ABS_SLOPE = 30.0   # макс. наклон [%]
 V_JUMP_KMH = 15.0      # праг за "скачане" на скоростта между сегменти
 V_JUMP_MIN = 20.0      # гледаме спайкове само над тази скорост [km/h]
 
@@ -300,11 +300,17 @@ def compute_flat_ref_speeds(seg_glide):
 
 
 def get_slope_training_data(seg_glide, flat_refs):
+    """
+    Обучаващите данни за F(slope):
+    - използваме само сегменти с |slope| >= 1% (изключваме -1..+1)
+    - диапазонът на наклона е [-3, 30]%.
+    """
     df = seg_glide.copy()
     df["V_flat_ref"] = df["activity"].map(flat_refs)
     mask = (
         df["valid_basic"] &
-        df["slope_pct"].between(-3.0, 15.0) &
+        df["slope_pct"].between(-3.0, 30.0) &
+        (np.abs(df["slope_pct"]) >= 1.0) &
         df["V_flat_ref"].notna() &
         (df["v_glide"] > 0)
     )
@@ -336,8 +342,21 @@ def apply_slope_modulation(seg_glide, slope_poly, V_crit):
     F_vals = slope_poly(slopes)
     F_vals = np.clip(F_vals, 0.1, 3.0)
 
+    # 1) Без модулация около нулата: |slope| <= 1% -> F = 1
+    mask_mid = np.abs(slopes) <= 1.0
+    F_vals[mask_mid] = 1.0
+
+    # 2) За наклон < -1% (леко спускане) искаме F <= 1
+    mask_down = slopes < -1.0
+    F_vals[mask_down] = np.minimum(F_vals[mask_down], 1.0)
+
+    # 3) За наклон > 1% (изкачване) искаме F >= 1
+    mask_up = slopes > 1.0
+    F_vals[mask_up] = np.maximum(F_vals[mask_up], 1.0)
+
     v_flat_eq = df["v_glide"].values * F_vals
 
+    # Сегменти под -3% ги приравняваме директно към 70% от V_crit
     if V_crit is not None and V_crit > 0:
         idx_below = df["slope_pct"] < -3.0
         v_flat_eq[idx_below] = 0.7 * V_crit
@@ -666,3 +685,4 @@ st.download_button(
     file_name="segments_glide_slope_zones.csv",
     mime="text/csv"
 )
+
