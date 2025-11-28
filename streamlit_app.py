@@ -313,28 +313,39 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
 
 
 # --------------------------------------------------------------------------------
-# Модел 2 – Наклон (ГЛОБАЛЕН ΔV%(slope))
+# Модел 2 – Наклон (ГЛОБАЛЕН ΔV%(slope), ПО СЕГМЕНТИ)
 # --------------------------------------------------------------------------------
-def compute_slope_model(segments_glide: pd.DataFrame):
+def compute_slope_model(
+    segments_glide: pd.DataFrame,
+    alpha_slope: float = 0.5,
+    dv_clip: float = 40.0,
+):
     """
-    Глобален ΔV%(slope) модел:
+    Глобален ΔV%(slope) модел, прилаган ПО СЕГМЕНТИ:
 
     1) За всяка активност A:
        - намираме V_flat,A от сегментите с |slope| <= FLAT_BAND;
        - за всички нейни сегменти смятаме ΔV_real,S = 100 * (V_glide,S - V_flat,A) / V_flat,A.
 
-    2) Всички (s_S, ΔV_real,S) от всички активности влизат в един общ обучаващ набор
-       за глобален квадратичен модел ΔV_model(s).
+    2) Всички (s_S, ΔV_real,S) от всички активности влизат в общ обучаващ набор
+       за глобален квадратичен модел ΔV_model_raw(s).
 
-    3) За всички сегменти прилагаме V_final,S = V_glide,S / f_slope(s_S),
-       където f_slope(s) = 1 + ΔV_model(s)/100 в диапазона (SLOPE_MODEL_MIN, SLOPE_MODEL_MAX),
-       а извън него f_slope = 1.
+    3) За всеки сегмент S:
+       - взимаме ΔV_model_raw(s_S) от полинома,
+       - омекотяваме: ΔV_model = alpha_slope * ΔV_model_raw,
+       - клипваме в [-dv_clip, +dv_clip],
+       - ако сегментът е извън диапазона на модела (s <= SLOPE_MODEL_MIN,
+         s >= SLOPE_MODEL_MAX или |s| <= FLAT_BAND) → ΔV_model = 0.
+       Получаваме:
+         f_poly(s) = 1 + ΔV_model/100
+         coef_slope(s) = 1 / f_poly(s)
+         V_final = V_glide * coef_slope(s)
     """
     seg = segments_glide.copy()
     if seg.empty:
         return seg, pd.DataFrame(), None
 
-    # 1) V_flat по активност
+    # 1) V_flat по активност (от V_glide)
     vflat_map = {}
     for aid, g in seg.groupby("activity_id"):
         flat = g[abs(g["slope_pct"]) <= FLAT_BAND]
@@ -346,7 +357,7 @@ def compute_slope_model(segments_glide: pd.DataFrame):
     seg["V_flat_A"] = seg["activity_id"].map(vflat_map)
     seg["DeltaV_real"] = 100.0 * (seg["V_glide"] - seg["V_flat_A"]) / seg["V_flat_A"]
 
-    # 2) Глобален обучаващ набор за ΔV%(slope)
+    # 2) Обучаващ набор за ΔV%(slope)
     train = seg[
         (seg["slope_pct"] > SLOPE_MODEL_MIN)
         & (seg["slope_pct"] < SLOPE_MODEL_MAX)
@@ -354,8 +365,10 @@ def compute_slope_model(segments_glide: pd.DataFrame):
     ].copy()
 
     if len(train) < 20:
+        seg["DeltaV_model_raw"] = 0.0
         seg["DeltaV_model"] = 0.0
-        seg["f_slope"] = 1.0
+        seg["f_poly"] = 1.0
+        seg["coef_slope"] = 1.0
         seg["V_final"] = seg["V_glide"]
         summary = (
             seg.groupby("activity_id")
@@ -389,8 +402,10 @@ def compute_slope_model(segments_glide: pd.DataFrame):
 
     # Ако няма стабилен полином
     if slope_poly is None:
+        seg["DeltaV_model_raw"] = 0.0
         seg["DeltaV_model"] = 0.0
-        seg["f_slope"] = 1.0
+        seg["f_poly"] = 1.0
+        seg["coef_slope"] = 1.0
         seg["V_final"] = seg["V_glide"]
         summary = (
             seg.groupby("activity_id")
@@ -419,20 +434,34 @@ def compute_slope_model(segments_glide: pd.DataFrame):
         )
         return seg, summary, None
 
-    # 3) Прилагаме глобалния модел
-    seg["DeltaV_model"] = slope_poly(seg["slope_pct"])
+    # 3) Прилагаме глобалния модел по сегмент
+    seg["DeltaV_model_raw"] = slope_poly(seg["slope_pct"])
 
-    def f_slope(s):
-        s_val = float(s)
-        if abs(s_val) <= FLAT_BAND:
-            return 1.0
-        if s_val <= SLOPE_MODEL_MIN or s_val >= SLOPE_MODEL_MAX:
-            return 1.0
-        dv_model = float(slope_poly(s_val))
-        return 1.0 + dv_model / 100.0
+    # омекотяване
+    seg["DeltaV_model"] = alpha_slope * seg["DeltaV_model_raw"]
 
-    seg["f_slope"] = seg["slope_pct"].apply(f_slope)
-    seg["V_final"] = seg["V_glide"] / seg["f_slope"]
+    # извън диапазона на модела -> без корекция
+    outside_mask = (
+        (seg["slope_pct"] <= SLOPE_MODEL_MIN)
+        | (seg["slope_pct"] >= SLOPE_MODEL_MAX)
+        | (abs(seg["slope_pct"]) <= FLAT_BAND)
+    )
+    seg.loc[outside_mask, "DeltaV_model"] = 0.0
+
+    # клипване
+    seg["DeltaV_model"] = seg["DeltaV_model"].clip(-dv_clip, dv_clip)
+
+    # forward множител (как се променя скоростта при този наклон)
+    seg["f_poly"] = 1.0 + seg["DeltaV_model"] / 100.0
+
+    # защита да не делим на нула
+    seg.loc[seg["f_poly"] <= 0.1, "f_poly"] = 0.1
+
+    # коефициент за приравняване към равно (точно това, което искаш – умножаваме по него)
+    seg["coef_slope"] = 1.0 / seg["f_poly"]
+
+    # крайна скорост на равен терен (вече коригирана за Glide + наклон)
+    seg["V_final"] = seg["V_glide"] * seg["coef_slope"]
 
     # 4) Обобщение по активност
     activity_rows = []
@@ -608,6 +637,15 @@ deg_glide = st.sidebar.selectbox(
     options=[1, 2],
     index=1,
     help="1 = линеен, 2 = квадратичен модел",
+)
+
+alpha_slope = st.sidebar.slider(
+    "Омекотяване на модела за наклона (α_slope)",
+    min_value=0.0,
+    max_value=1.0,
+    value=0.5,
+    step=0.05,
+    help="0 = игнориране на наклона, 1 = пълно влияние на ΔV%(slope)",
 )
 
 cs_default = 20.0
@@ -787,12 +825,16 @@ else:
         st.info("Няма достатъчно downhill сегменти за визуализация на Glide модела.")
 
 # --------------------------------------------------------------------------------
-# Модел 2 – Наклон (ГЛОБАЛЕН ΔV%(slope))
+# Модел 2 – Наклон (ГЛОБАЛЕН ΔV%(slope) ПО СЕГМЕНТИ)
 # --------------------------------------------------------------------------------
 st.markdown("---")
-st.subheader("Модел 2 – Влияние на наклона (ΔV%) – глобален модел")
+st.subheader("Модел 2 – Влияние на наклона (ΔV%) – глобален модел по сегменти")
 
-segments_slope, slope_summary, slope_poly = compute_slope_model(segments_glide)
+segments_slope, slope_summary, slope_poly = compute_slope_model(
+    segments_glide,
+    alpha_slope=alpha_slope,
+    dv_clip=40.0,
+)
 
 if slope_summary.empty or slope_summary["n_slope_segments"].sum() == 0:
     st.warning("Няма достатъчно сегменти за модел на наклона.")
@@ -812,8 +854,20 @@ else:
         """
 В този модел за всеки сегмент използваме **V_glide** и го сравняваме със
 **средната скорост при почти равен наклон (-1..+1%) за същата активност**.
-ΔV_real% се смята по активност, но **ΔV_model(slope)** е глобален –
-един общ полином за всички активности.
+От всички сегменти обучаваме глобален модел **ΔV%(slope)** (квадратичен полином).
+
+След това за всеки сегмент с наклон *s*:
+- взимаме ΔV_model(s) от полинома,
+- омекотяваме го чрез α_slope и клипваме (напр. в диапазон [-40%, +40%]),
+- образуваме множител *f_poly(s) = 1 + ΔV_model/100*,
+- и приравняваме към равно чрез коефициент **coef_slope(s) = 1 / f_poly(s)**:
+
+\\[
+V_{final} = V_{glide} \\,\\cdot\\, coef\\_slope(s).
+\\]
+
+Т.е. **глайдът** дава един глобален коефициент за активността,  
+а **наклонът** – сегментен коефициент, който зависи от наклона на сегмента.
 """
     )
 
@@ -938,8 +992,7 @@ if not zones_table.empty:
     st.altair_chart(chart, use_container_width=True)
 
 st.success(
-    "Моделът за наклон вече е глобален ΔV%(slope), "
-    "ΔV_real се нормализира по V_flat за всяка активност, "
-    "а после всички сегменти се използват за един общ полином."
+    "Glide моделът дава един глобален коефициент за активността, "
+    "а наклоновият модел вече се прилага по сегменти чрез coef_slope(s), "
+    "с омекотяване (α_slope) и безопасно клипване на ΔV%(slope), за да няма „излитане“ при крайни случаи."
 )
-
