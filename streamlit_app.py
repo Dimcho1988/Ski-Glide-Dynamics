@@ -621,24 +621,19 @@ st.dataframe(
 )
 
 # Excel download
-buffer = BytesIO()
+# Експорт като CSV (Excel го отваря директно)
+csv_bytes = export_df.to_csv(index=False).encode("utf-8")
 
-# опитваме xlsxwriter, ако го няма – падаме към openpyxl
-try:
-    import xlsxwriter  # noqa: F401
-    excel_engine = "xlsxwriter"
-except ImportError:
-    excel_engine = "openpyxl"
-
-with pd.ExcelWriter(buffer, engine=excel_engine) as writer:
-    export_df.to_excel(writer, index=False, sheet_name="segments")
-
-buffer.seek(0)
-
-safe_name = selected_activity.replace(":", "_").replace(" ", "_").replace(".", "_")
-st.download_button(
-    label="Свали Excel (сегменти + референтни зависимости)",
-    data=buffer,
-    file_name=f"segments_{safe_name}.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+safe_name = (
+    selected_activity.replace(":", "_")
+    .replace(" ", "_")
+    .replace(".", "_")
 )
+
+st.download_button(
+    label="Свали CSV (сегменти + референтни зависимости)",
+    data=csv_bytes,
+    file_name=f"segments_{safe_name}.csv",
+    mime="text/csv",
+)
+
