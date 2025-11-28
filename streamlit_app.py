@@ -622,8 +622,17 @@ st.dataframe(
 
 # Excel download
 buffer = BytesIO()
-with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+
+# опитваме xlsxwriter, ако го няма – падаме към openpyxl
+try:
+    import xlsxwriter  # noqa: F401
+    excel_engine = "xlsxwriter"
+except ImportError:
+    excel_engine = "openpyxl"
+
+with pd.ExcelWriter(buffer, engine=excel_engine) as writer:
     export_df.to_excel(writer, index=False, sheet_name="segments")
+
 buffer.seek(0)
 
 safe_name = selected_activity.replace(":", "_").replace(" ", "_").replace(".", "_")
