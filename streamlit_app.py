@@ -202,15 +202,6 @@ def compute_glide_model(segments: pd.DataFrame, alpha_glide: float, deg_glide: i
     def soften_delta_asym(delta: float) -> float:
         """
         Асиметрично, плавно омекотяване на Δ = K_raw - 1.
-
-        - За бързи ски (Δ > 0):
-            * до +10% -> без омекотяване
-            * +10%..+15% -> smoothstep към M_MIN=0.4
-            * над +15% -> 40% от отклонението
-        - За бавни ски (Δ < 0):
-            * до -20% -> без омекотяване
-            * -20%..-30% -> smoothstep към M_MIN=0.7
-            * под -30% -> 70% от отклонението
         """
         if not np.isfinite(delta):
             return 0.0
@@ -364,7 +355,7 @@ def compute_slope_model(segments_glide: pd.DataFrame):
     if seg.empty:
         return seg, pd.DataFrame(), None
 
-    # 1) V_flat по активност (референтна "равна" скорост)
+    # 1) V_flat по активност
     vflat_map = {}
     for aid, g in seg.groupby("activity_id"):
         flat = g[g["slope_pct"].abs() <= FLAT_BAND]
@@ -408,7 +399,7 @@ def compute_slope_model(segments_glide: pd.DataFrame):
                         "mean_DeltaV_real": np.nan,
                         "V_overall_real": (g["V_kmh"] * g["duration_s"]).sum()
                         / g["duration_s"].sum(),
-                        "V_overall_glide": (g["V_glide"] * g["duration_s"]).sum()
+                        "V_overall_glide_seg": (g["V_glide"] * g["duration_s"]).sum()
                         / g["duration_s"].sum(),
                         "V_overall_final": (g["V_glide"] * g["duration_s"]).sum()
                         / g["duration_s"].sum(),
@@ -448,7 +439,7 @@ def compute_slope_model(segments_glide: pd.DataFrame):
                         "mean_DeltaV_real": np.nan,
                         "V_overall_real": (g["V_kmh"] * g["duration_s"]).sum()
                         / g["duration_s"].sum(),
-                        "V_overall_glide": (g["V_glide"] * g["duration_s"]).sum()
+                        "V_overall_glide_seg": (g["V_glide"] * g["duration_s"]).sum()
                         / g["duration_s"].sum(),
                         "V_overall_final": (g["V_glide"] * g["duration_s"]).sum()
                         / g["duration_s"].sum(),
@@ -535,7 +526,7 @@ def compute_slope_model(segments_glide: pd.DataFrame):
                 "mean_slope_model": mean_slope_model,
                 "mean_DeltaV_real": mean_DeltaV_real,
                 "V_overall_real": V_overall_real_seg,
-                "V_overall_glide": V_overall_glide_seg,
+                "V_overall_glide_seg": V_overall_glide_seg,  # вътрешна стойност, UI няма да я ползва
                 "V_overall_final": V_overall_final_seg,
             }
         )
@@ -652,7 +643,6 @@ alpha_glide = st.sidebar.slider(
     max_value=1.0,
     value=0.5,
     step=0.05,
-    help="0 = игнориране на плъзгаемостта, 1 = пълно влияние",
 )
 
 deg_glide = st.sidebar.selectbox(
@@ -676,7 +666,6 @@ speed_min_zone = st.sidebar.number_input(
     max_value=10.0,
     value=2.0,
     step=0.5,
-    help="Сегменти с по-ниска скорост (стрелба, почивка) не влизат в зоните.",
 )
 
 st.sidebar.markdown("---")
@@ -770,10 +759,8 @@ segments_glide, glide_summary, glide_poly = compute_glide_model(
 if glide_summary.empty:
     st.warning("Няма достатъчно downhill сегменти за модел на плъзгаемостта.")
 else:
-    # Вземаме реалната средна скорост от оригиналните данни
     real_map = info_df.set_index("activity_id")["V_overall_real"]
     glide_summary["V_overall_real"] = glide_summary["activity_id"].map(real_map)
-    # ИЗРИЧНО изчисляваме V_overall_glide от реалната и K_glide_soft:
     glide_summary["V_overall_glide"] = (
         glide_summary["V_overall_real"] / glide_summary["K_glide_soft"]
     )
@@ -849,6 +836,10 @@ if slope_summary.empty or slope_summary["n_slope_segments"].sum() == 0:
 else:
     real_map = info_df.set_index("activity_id")["V_overall_real"]
     slope_summary["V_overall_real"] = slope_summary["activity_id"].map(real_map)
+
+    # ВАЖНО: V_overall_glide да е същото като в Glide summary
+    glide_map = glide_summary.set_index("activity_id")["V_overall_glide"]
+    slope_summary["V_overall_glide"] = slope_summary["activity_id"].map(glide_map)
 
     st.dataframe(
         slope_summary[
@@ -963,13 +954,11 @@ st.subheader("Експорт в Excel за избрана активност")
 if selected_activity == "Всички активности":
     st.info("За експорт избери конкретна активност от падащото меню по-горе.")
 else:
-    # филтрираните сегменти за тази активност + зони
     seg_act = seg_zoned[seg_zoned["activity_id"] == selected_activity].copy()
 
     if seg_act.empty:
         st.warning("Няма сегменти за избраната активност.")
     else:
-        # Основна таблица по сегменти: сурова скорост, Glide, Slope, Зона
         export_cols = [
             "activity_id",
             "seg_id",
@@ -987,10 +976,8 @@ else:
         export_cols = [c for c in export_cols if c in seg_act.columns]
         seg_export = seg_act[export_cols].copy()
 
-        # Зонно обобщение само за тази активност
         zones_export = zone_summary(seg_act)
 
-        # Excel файл в паметта
         output = BytesIO()
         with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
             seg_export.to_excel(writer, sheet_name="segments", index=False)
