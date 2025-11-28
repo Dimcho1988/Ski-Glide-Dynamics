@@ -255,7 +255,7 @@ def fit_glide_poly(train_df):
 
 def compute_glide_coefficients(seg, glide_poly):
     """
-    Връща dict activity -> K_glide (омекотен с DAMP_GLIDE и ограничен в [0.85, 1.40]).
+    Връща dict activity -> K_glide (омекотен с DAMP_GLIDE и ограничен в [0.9, 1.25]).
     """
     train = get_glide_training_segments(seg)
     if glide_poly is None or train.empty:
@@ -278,8 +278,8 @@ def compute_glide_coefficients(seg, glide_poly):
         k_damped = 1.0 + DAMP_GLIDE * (k_raw - 1.0)
 
         # 3) ограничение за плъзгаемостта
-        #    не по-бавно от 0.85 и не по-бързо от 1.40
-        k_limited = max(0.85, min(1.40, k_damped))
+        #    не по-бавно от 0.9 и не по-бързо от 1.25
+        k_limited = max(0.9, min(1.25, k_damped))
 
         coeffs[act] = k_limited
 
