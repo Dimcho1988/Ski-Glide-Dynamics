@@ -340,7 +340,7 @@ def apply_slope_modulation(seg_glide, slope_poly, V_crit):
 
     slopes = df["slope_pct"].values.astype(float)
     F_vals = slope_poly(slopes)
-    F_vals = np.clip(F_vals, 0.1, 3.0)
+    F_vals = np.clip(F_vals, 0.7, 1.7)
 
     # 1) Без модулация около нулата: |slope| <= 1% -> F = 1
     mask_mid = np.abs(slopes) <= 1.0
