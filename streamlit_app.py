@@ -382,32 +382,43 @@ def summarize_zones(df):
 # ---------------------------------------------------------
 # ОБОБЩЕНИ ТАБЛИЦИ ЗА МОДУЛАЦИИТЕ
 # ---------------------------------------------------------
-def summarize_modulations(seg_base, seg_glide, seg_slope):
-    """
-    seg_base  – след basic филтри (v_kmh)
-    seg_glide – след модулация по плъзгаемост (v_glide)
-    seg_slope – след модулация по наклон (v_flat_eq)
-    """
+def summarize_glide(seg_glide):
+    """Обобщение след първата модулация (плъзгаемост)."""
+    df = seg_glide[seg_glide["valid_basic"]].copy()
+    if df.empty:
+        return pd.DataFrame(columns=[
+            "activity", "v_real_mean", "v_glide_mean", "K_glide_const", "K_glide_eff"
+        ])
 
-    # 1) Първа модулация
-    g1 = seg_glide[seg_glide["valid_basic"]].groupby("activity").agg(
+    g = df.groupby("activity").agg(
         v_real_mean=("v_kmh", "mean"),
         v_glide_mean=("v_glide", "mean"),
-        K_glide_const=("K_glide", "mean")  # по принцип константа за активност
+        K_glide_const=("K_glide", "mean")
     ).reset_index()
-    g1["K_glide_eff"] = g1["v_glide_mean"] / g1["v_real_mean"]
+    g["K_glide_eff"] = g["v_glide_mean"] / g["v_real_mean"]
+    return g
 
-    # 2) Втора модулация
-    g2 = seg_slope[seg_slope["valid_basic"]].groupby("activity").agg(
+
+def summarize_full(seg_glide, seg_slope):
+    """Обобщение след двете модулации (плъзгаемост + наклон)."""
+    g1 = summarize_glide(seg_glide)
+
+    df2 = seg_slope[seg_slope["valid_basic"]].copy()
+    if df2.empty:
+        g1["v_flat_mean"] = np.nan
+        g1["K_slope_eff"] = np.nan
+        g1["K_total"] = np.nan
+        return g1
+
+    g2 = df2.groupby("activity").agg(
         v_glide_mean=("v_glide", "mean"),
         v_flat_mean=("v_flat_eq", "mean")
     ).reset_index()
 
-    summary = pd.merge(g1, g2, on="activity", how="left", suffixes=("_g1", "_g2"))
-    summary["K_slope_eff"] = summary["v_flat_mean"] / summary["v_glide_mean_g2"]
-    summary["K_total"] = summary["v_flat_mean"] / summary["v_real_mean"]
-
-    return g1, summary
+    out = pd.merge(g1, g2, on="activity", how="left")
+    out["K_slope_eff"] = out["v_flat_mean"] / out["v_glide_mean"]
+    out["K_total"] = out["v_flat_mean"] / out["v_real_mean"]
+    return out
 
 
 # ---------------------------------------------------------
@@ -520,11 +531,9 @@ st.dataframe(
 )
 
 # Обобщена таблица след първата модулация
-glide_summary, full_summary_dummy = summarize_modulations(segments_f, seg_glide, seg_glide)
+glide_summary = summarize_glide(seg_glide)
 st.subheader("Обобщение по активности – първа модулация (плъзгаемост)")
-st.dataframe(
-    glide_summary[["activity", "v_real_mean", "v_glide_mean", "K_glide_const", "K_glide_eff"]]
-)
+st.dataframe(glide_summary)
 
 # 8) МОДЕЛ ЗА НАКЛОН
 flat_refs = compute_flat_ref_speeds(seg_glide)
@@ -570,21 +579,10 @@ st.dataframe(
     seg_slope[["activity", "seg_idx", "slope_pct", "v_glide", "v_flat_eq"]].head(30)
 )
 
-# Обобщена таблица след втората модулация
-glide_summary2, full_summary = summarize_modulations(segments_f, seg_glide, seg_slope)
+# Обобщена таблица след двете модулации
+full_summary = summarize_full(seg_glide, seg_slope)
 st.subheader("Обобщение по активности – след двете модулации (плъзгаемост + наклон)")
-st.dataframe(
-    full_summary[[
-        "activity",
-        "v_real_mean",
-        "v_glide_mean_g2",
-        "v_flat_mean",
-        "K_glide_const",
-        "K_glide_eff",
-        "K_slope_eff",
-        "K_total"
-    ]]
-)
+st.dataframe(full_summary)
 
 # 9) ЗОНИ
 seg_zones = assign_zones(seg_slope, V_crit_input)
@@ -631,3 +629,4 @@ st.download_button(
     file_name="segments_glide_slope_zones.csv",
     mime="text/csv"
 )
+
