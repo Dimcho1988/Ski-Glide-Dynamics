@@ -5,6 +5,7 @@ import xml.etree.ElementTree as ET
 from io import BytesIO
 from datetime import datetime
 import math
+import altair as alt
 
 # ---------------------------------------------------------
 # НАСТРОЙКИ ПО ПОДРАЗБИРАНЕ – МОЖЕШ ДА ПРОМЕНЯШ СПОРЕД НУЖДИТЕ
@@ -37,7 +38,6 @@ def parse_tcx(file, activity_label):
     tree = ET.parse(BytesIO(content))
     root = tree.getroot()
 
-    # TCX namespace
     ns = {"tcx": "http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2"}
 
     rows = []
@@ -87,7 +87,8 @@ def parse_tcx(file, activity_label):
     if df["dist"].isna().all():
         df["dist"] = 0.0
         for i in range(1, len(df)):
-            if None in (df.at[i-1, "lat"], df.at[i-1, "lon"], df.at[i, "lat"], df.at[i, "lon"]):
+            if None in (df.at[i-1, "lat"], df.at[i-1, "lon"],
+                        df.at[i, "lat"], df.at[i, "lon"]):
                 df.at[i, "dist"] = df.at[i-1, "dist"]
                 continue
             d = haversine(
@@ -114,15 +115,13 @@ def haversine(lat1, lon1, lat2, lon2):
 
 
 # ---------------------------------------------------------
-# СЕГМЕНТИРАНЕ НА 7-S ИНТЕРВАЛИ (ПОПРАВЕНО)
+# СЕГМЕНТИРАНЕ НА 7-S ИНТЕРВАЛИ
 # ---------------------------------------------------------
 def build_segments(df_activity, activity_label):
     """
     Сегментира по време (7 s) и връща DF със сегменти:
     ['activity','seg_idx','t_start','t_end','dt_s','d_m','slope_pct',
      'v_kmh','hr_mean']
-    Наклонът е по разлика elevation първа/последна точка.
-    Скоростта е d/dt.
     """
     if df_activity.empty:
         return pd.DataFrame(columns=[
@@ -145,7 +144,7 @@ def build_segments(df_activity, activity_label):
     while start_idx < n - 1:
         t0 = times[start_idx]
 
-        # намираме краен индекс, където dt >= T_SEG
+        # търсим краен индекс, където dt >= T_SEG
         end_idx = start_idx + 1
         while end_idx < n:
             dt_tmp = (times[end_idx] - t0) / np.timedelta64(1, "s")
@@ -157,7 +156,7 @@ def build_segments(df_activity, activity_label):
             break
 
         t1 = times[end_idx]
-        dt = (t1 - t0) / np.timedelta64(1, "s")  # в секунди (float)
+        dt = (t1 - t0) / np.timedelta64(1, "s")  # float seconds
 
         d0 = dists[start_idx]
         d1 = dists[end_idx]
@@ -212,17 +211,14 @@ def build_segments(df_activity, activity_label):
 def apply_basic_filters(segments):
     """
     1) |slope| <= 30%
-    2) скоростта да не "скача" нереалистично спрямо предишния сегмент
-    Връща DF с колона 'valid_basic'.
+    2) без нереалистични скокове в скоростта
     """
     seg = segments.copy()
 
-    # 1) Наклон
     valid_slope = seg["slope_pct"].between(-MAX_ABS_SLOPE, MAX_ABS_SLOPE)
     valid_slope &= seg["slope_pct"].notna()
     seg["valid_basic"] = valid_slope
 
-    # 2) Нереалистични скокове в скоростта (по активност)
     def mark_speed_spikes(group):
         group = group.sort_values("seg_idx").copy()
         spike = np.zeros(len(group), dtype=bool)
@@ -428,10 +424,10 @@ if not uploaded_files:
     st.info("Качи поне един TCX файл, за да започнем.")
     st.stop()
 
-# 1) Парсване на всички файлове
+# 1) Парсване на всички файлове – използваме името на файла като label
 all_points = []
-for i, f in enumerate(uploaded_files):
-    label = f"act_{i+1}"
+for f in uploaded_files:
+    label = f.name
     df_act = parse_tcx(f, label)
     if df_act.empty:
         continue
@@ -458,21 +454,23 @@ if segments.empty:
     st.error("Не успях да създам сегменти. Провери TCX файловете.")
     st.stop()
 
-st.subheader("Сегменти преди филтриране (пример)")
-st.dataframe(segments.head(20))
+st.subheader("Сегменти преди филтриране (7 s, средна скорост и наклон)")
+st.dataframe(segments[["activity", "seg_idx", "dt_s", "d_m", "slope_pct", "v_kmh", "hr_mean"]].head(30))
 
 # 3) Базови филтри
 segments_f = apply_basic_filters(segments)
 
-st.subheader("Сегменти след базови филтри")
+st.subheader("Сегменти след базови филтри (валидни / невалидни)")
 st.write(f"Общо сегменти: {len(segments_f)}, валидни: {segments_f['valid_basic'].sum()}")
-st.dataframe(segments_f.head(20))
+st.dataframe(
+    segments_f[["activity", "seg_idx", "slope_pct", "v_kmh", "valid_basic", "speed_spike"]].head(30)
+)
 
 # 4–7) Модел за плъзгаемост
 train_glide = get_glide_training_segments(segments_f)
-st.subheader("Сегменти за модел на плъзгаемостта")
+st.subheader("Сегменти за модел на плъзгаемостта (наклон ≥ -5% и предхождани от такъв)")
 st.write(f"Сегменти за обучение: {len(train_glide)}")
-st.dataframe(train_glide.head(20))
+st.dataframe(train_glide[["activity", "seg_idx", "slope_pct", "v_kmh"]].head(30))
 
 glide_poly = fit_glide_poly(train_glide)
 if glide_poly is None:
@@ -485,8 +483,32 @@ else:
     st.write("Коефициенти на плъзгаемост по активност:", glide_coeffs)
     seg_glide = apply_glide_modulation(segments_f, glide_coeffs)
 
-st.subheader("Сегменти с модулирана по плъзгаемост скорост (v_glide)")
-st.dataframe(seg_glide.head(20))
+    # Визуализация на модела за плъзгаемостта
+    if not train_glide.empty:
+        s_min = train_glide["slope_pct"].min()
+        s_max = train_glide["slope_pct"].max()
+        s_grid = np.linspace(s_min, s_max, 200)
+        df_glide_curve = pd.DataFrame({
+            "slope_pct": s_grid,
+            "v_model": glide_poly(s_grid)
+        })
+
+        chart_points = alt.Chart(train_glide).mark_circle(size=30).encode(
+            x=alt.X("slope_pct", title="Наклон [%]"),
+            y=alt.Y("v_kmh", title="Скорост [km/h]"),
+            color="activity:N"
+        )
+        chart_curve = alt.Chart(df_glide_curve).mark_line().encode(
+            x="slope_pct",
+            y="v_model"
+        )
+        st.subheader("Модел за плъзгаемост: скорост vs наклон")
+        st.altair_chart(chart_points + chart_curve, use_container_width=True)
+
+st.subheader("Сегменти с модулирана по плъзгаемост скорост")
+st.dataframe(
+    seg_glide[["activity", "seg_idx", "slope_pct", "v_kmh", "K_glide", "v_glide"]].head(30)
+)
 
 # 8) Модел за наклон
 flat_refs = compute_flat_ref_speeds(seg_glide)
@@ -496,7 +518,7 @@ st.write(flat_refs)
 slope_train = get_slope_training_data(seg_glide, flat_refs)
 st.subheader("Сегменти за модел на наклона (F = V_flat_ref / v_glide)")
 st.write(f"Сегменти за обучение: {len(slope_train)}")
-st.dataframe(slope_train.head(20))
+st.dataframe(slope_train.head(30))
 
 slope_poly = fit_slope_poly(slope_train)
 if slope_poly is None:
@@ -504,10 +526,34 @@ if slope_poly is None:
     seg_slope = apply_slope_modulation(seg_glide, None, V_crit_input)
 else:
     st.write("Коефициенти на полинома за наклон (F = g(slope)):", slope_poly.coefficients)
+
+    # визуализация на F(slope)
+    if not slope_train.empty:
+        s_min2 = slope_train["slope_pct"].min()
+        s_max2 = slope_train["slope_pct"].max()
+        s_grid2 = np.linspace(s_min2, s_max2, 200)
+        df_slope_curve = pd.DataFrame({
+            "slope_pct": s_grid2,
+            "F_model": slope_poly(s_grid2)
+        })
+
+        chart_points2 = alt.Chart(slope_train).mark_circle(size=30).encode(
+            x=alt.X("slope_pct", title="Наклон [%]"),
+            y=alt.Y("F", title="F = V_flat_ref / v_glide"),
+        )
+        chart_curve2 = alt.Chart(df_slope_curve).mark_line().encode(
+            x="slope_pct",
+            y="F_model"
+        )
+        st.subheader("Модел за наклон: F(slope)")
+        st.altair_chart(chart_points2 + chart_curve2, use_container_width=True)
+
     seg_slope = apply_slope_modulation(seg_glide, slope_poly, V_crit_input)
 
-st.subheader("Сегменти с модулирана по наклон скорост (v_flat_eq)")
-st.dataframe(seg_slope.head(20))
+st.subheader("Сегменти с модулирана по наклон скорост (еквивалентна на равно)")
+st.dataframe(
+    seg_slope[["activity", "seg_idx", "slope_pct", "v_glide", "v_flat_eq"]].head(30)
+)
 
 # 9) Зони по критична скорост
 seg_zones = assign_zones(seg_slope, V_crit_input)
@@ -524,8 +570,22 @@ zone_summary_all = zone_summary.groupby("zone").agg(
 ).reset_index()
 st.dataframe(zone_summary_all)
 
-# Експорт
-st.subheader("Експорт на всички сегменти (Excel)")
+# Детайлен изглед по активност
+st.subheader("Детайлен изглед на сегментите по активност")
+act_list = sorted(seg_zones["activity"].unique())
+act_selected = st.selectbox("Избери активност (името на файла):", act_list)
+
+act_df = seg_zones[seg_zones["activity"] == act_selected].copy()
+st.dataframe(
+    act_df[[
+        "activity", "seg_idx", "t_start", "dt_s", "d_m",
+        "slope_pct", "v_kmh", "K_glide", "v_glide",
+        "v_flat_eq", "rel_crit", "zone", "hr_mean"
+    ]]
+)
+
+# Експорт – CSV (без xlsxwriter)
+st.subheader("Експорт на всички сегменти (CSV)")
 export_cols = [
     "activity", "seg_idx", "t_start", "t_end", "dt_s", "d_m",
     "slope_pct", "v_kmh", "valid_basic", "K_glide", "v_glide",
@@ -533,14 +593,11 @@ export_cols = [
 ]
 export_df = seg_zones[export_cols].copy()
 
-to_excel = BytesIO()
-with pd.ExcelWriter(to_excel, engine="xlsxwriter") as writer:
-    export_df.to_excel(writer, index=False, sheet_name="segments")
-to_excel.seek(0)
+csv_data = export_df.to_csv(index=False).encode("utf-8")
 
 st.download_button(
-    label="Свали сегментите като Excel",
-    data=to_excel,
-    file_name="segments_glide_slope_zones.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    label="Свали сегментите като CSV",
+    data=csv_data,
+    file_name="segments_glide_slope_zones.csv",
+    mime="text/csv"
 )
