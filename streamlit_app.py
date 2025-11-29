@@ -271,13 +271,11 @@ def compute_glide_coefficients(seg, glide_poly):
         if v_model <= 0:
             continue
 
-        # 1) „истински“ коефициент от модела
+        # реален коефициент
         k_raw = v_model / v_real
-
-        # 2) омекотяване (α = DAMP_GLIDE, 0–1)
+        # омекотяване
         k_damped = 1.0 + DAMP_GLIDE * (k_raw - 1.0)
-
-        # 3) ограничение за плъзгаемостта
+        # ограничения
         k_limited = max(0.9, min(1.25, k_damped))
 
         coeffs[act] = k_limited
@@ -302,7 +300,6 @@ def compute_flat_ref_speeds(seg_glide):
         g_flat = g[mask_flat]
         if g_flat.empty:
             continue
-        # средна скорост на равно (след плъзгаемост)
         v_flat = g_flat["v_glide"].mean()
         if v_flat > 0:
             flat_refs[act] = v_flat
@@ -312,7 +309,7 @@ def compute_flat_ref_speeds(seg_glide):
 def get_slope_training_data(seg_glide, flat_refs):
     """
     Обучаващите данни за F(slope):
-    - сегменти с наклон в [-15, +15]% (включително -1..+1%)
+    - използваме сегменти с наклон в [-15, +15]% (вкл. -1..+1)
     """
     df = seg_glide.copy()
     df["V_flat_ref"] = df["activity"].map(flat_refs)
@@ -348,23 +345,21 @@ def apply_slope_modulation(seg_glide, slope_func, V_crit):
 
     slopes = df["slope_pct"].values.astype(float)
     F_vals = slope_func(slopes)
-    F_vals = np.clip(F_vals, 0.7, 1.7)   # диапазон на F
+    F_vals = np.clip(F_vals, 0.7, 1.7)
 
-    # 1) Без модулация около нулата: |slope| <= 1% -> F = 1
+    # |slope| <= 1% -> F = 1
     mask_mid = np.abs(slopes) <= 1.0
     F_vals[mask_mid] = 1.0
-
-    # 2) За наклон < -1% (леко спускане) искаме F <= 1
+    # спускане <-1% -> F<=1
     mask_down = slopes < -1.0
     F_vals[mask_down] = np.minimum(F_vals[mask_down], 1.0)
-
-    # 3) За наклон > 1% (изкачване) искаме F >= 1
+    # изкачване >1% -> F>=1
     mask_up = slopes > 1.0
     F_vals[mask_up] = np.maximum(F_vals[mask_up], 1.0)
 
     v_flat_eq = df["v_glide"].values * F_vals
 
-    # Сегменти под -3% ги приравняваме директно към 70% от V_crit
+    # силни спускания под -3% -> 70% от V_crit
     if V_crit is not None and V_crit > 0:
         idx_below = df["slope_pct"] < -3.0
         v_flat_eq[idx_below] = 0.7 * V_crit
@@ -416,7 +411,6 @@ def summarize_zones(df):
 # ОБОБЩЕНИ ТАБЛИЦИ ЗА МОДУЛАЦИИТЕ
 # ---------------------------------------------------------
 def summarize_glide(seg_glide):
-    """Обобщение след първата модулация (плъзгаемост)."""
     df = seg_glide[seg_glide["valid_basic"]].copy()
     if df.empty:
         return pd.DataFrame(columns=[
@@ -433,7 +427,6 @@ def summarize_glide(seg_glide):
 
 
 def summarize_full(seg_glide, seg_slope):
-    """Обобщение след двете модулации (плъзгаемост + наклон)."""
     g1 = summarize_glide(seg_glide)
 
     df2 = seg_slope[seg_slope["valid_basic"]].copy()
@@ -461,9 +454,7 @@ def summarize_full(seg_glide, seg_slope):
 # ---------------------------------------------------------
 def build_hr_speed_model(seg_slope):
     """
-    Връща:
-    - hr_poly: np.poly1d за HR = a*V + b
-    - agg: DF със средна v_flat_eq и HR по активност (time-weighted)
+    Модел HR = a*V + b върху средна v_flat_eq и HR по активности.
     """
     df = seg_slope[seg_slope["valid_basic"]].copy()
     if df.empty:
@@ -515,12 +506,11 @@ def assign_hr_zones(df, HR_crit):
 
 def summarize_hr_zones(df):
     if df.empty:
-        return pd.DataFrame(columns=["activity", "zone_hr", "total_time_s", "mean_hr", "mean_v_flat_eq"])
+        return pd.DataFrame(columns=["activity", "zone_hr", "total_time_s", "mean_hr"])
 
     agg = df.dropna(subset=["zone_hr"]).groupby(["activity", "zone_hr"]).agg(
         total_time_s=("dt_s", "sum"),
         mean_hr=("hr_mean", "mean"),
-        mean_v_flat_eq=("v_flat_eq", "mean"),
     ).reset_index()
     return agg
 
@@ -533,13 +523,11 @@ st.title("Модел за плъзгаемост, наклон и пулсови
 
 st.sidebar.header("Настройки")
 
-# Критична скорост
 V_crit_input = st.sidebar.number_input(
     "Критична скорост V_crit [km/h]",
     min_value=0.0, max_value=60.0, value=20.0, step=0.5
 )
 
-# Степен на полиномите
 glide_deg = st.sidebar.selectbox(
     "Степен на полинома за плъзгаемост",
     options=[1, 2],
@@ -551,7 +539,6 @@ slope_deg = st.sidebar.selectbox(
     index=1
 )
 
-# Омекотяване на плъзгаемостта
 glide_damp = st.sidebar.slider(
     "Омекотяване на коефициента на плъзгаемост (α)",
     min_value=0.0,
@@ -561,7 +548,6 @@ glide_damp = st.sidebar.slider(
     help="α=1 – пълен ефект, α=0 – без корекция по плъзгаемост"
 )
 
-# презаписваме глобалните настройки
 GLIDE_POLY_DEG = glide_deg
 SLOPE_POLY_DEG = slope_deg
 DAMP_GLIDE = glide_damp
@@ -576,7 +562,7 @@ if not uploaded_files:
     st.info("Качи поне един TCX файл, за да започнем.")
     st.stop()
 
-# 1) Парсване – име на файла = име на активността
+# 1) Парсване
 all_points = []
 for f in uploaded_files:
     label = f.name
@@ -612,14 +598,13 @@ st.dataframe(
 
 # 3) Базови филтри
 segments_f = apply_basic_filters(segments)
-
 st.subheader("Сегменти след базови филтри")
 st.write(f"Общо сегменти: {len(segments_f)}, валидни: {segments_f['valid_basic'].sum()}")
 st.dataframe(
     segments_f[["activity", "seg_idx", "slope_pct", "v_kmh", "valid_basic", "speed_spike"]].head(30)
 )
 
-# 4–7) МОДЕЛ ЗА ПЛЪЗГАЕМОСТ
+# 4–7) Плъзгаемост
 train_glide = get_glide_training_segments(segments_f)
 st.subheader("Сегменти за модел на плъзгаемостта (наклон ≤ -5% и предходен сегмент също ≤ -5%)")
 st.write(f"Сегменти за обучение: {len(train_glide)}")
@@ -636,7 +621,6 @@ else:
     st.write("Коефициенти на плъзгаемост по активност (след омекотяване):", glide_coeffs)
     seg_glide = apply_glide_modulation(segments_f, glide_coeffs)
 
-    # визуализация на модела за плъзгаемост
     if not train_glide.empty:
         s_min = train_glide["slope_pct"].min()
         s_max = train_glide["slope_pct"].max()
@@ -663,12 +647,11 @@ st.dataframe(
     seg_glide[["activity", "seg_idx", "slope_pct", "v_kmh", "K_glide", "v_glide"]].head(30)
 )
 
-# Обобщена таблица след първата модулация
 glide_summary = summarize_glide(seg_glide)
 st.subheader("Обобщение по активности – първа модулация (плъзгаемост)")
 st.dataframe(glide_summary)
 
-# 8) МОДЕЛ ЗА НАКЛОН (с изместване така, че F(0)=1)
+# 8) Наклон – F(0)=1
 flat_refs = compute_flat_ref_speeds(seg_glide)
 st.subheader("Референтни скорости на равно (от v_glide) по активност")
 st.write(flat_refs)
@@ -686,12 +669,10 @@ if raw_slope_poly is None:
 else:
     st.write(f"Полином за наклон (степен {SLOPE_POLY_DEG}), коефициенти:", raw_slope_poly.coefficients)
 
-    # изместване: F(0) = 1 (т.е. 0 наклон -> 0 отклонение)
     F0 = float(raw_slope_poly(0.0))
     offset = F0 - 1.0
     slope_func = lambda s: raw_slope_poly(s) - offset
 
-    # визуализация на F(slope) с коригирана функция (всички точки, включително под 0)
     if not slope_train.empty:
         s_min2 = slope_train["slope_pct"].min()
         s_max2 = slope_train["slope_pct"].max()
@@ -709,7 +690,7 @@ else:
             x="slope_pct",
             y="F_model"
         )
-        st.subheader("Модел за наклон: F(slope) (F(0)=1, показани са всички точки)")
+        st.subheader("Модел за наклон: F(slope) (изместен така, че F(0)=1)")
         st.altair_chart(chart_points2 + chart_curve2, use_container_width=True)
 
     seg_slope = apply_slope_modulation(seg_glide, slope_func, V_crit_input)
@@ -719,12 +700,11 @@ st.dataframe(
     seg_slope[["activity", "seg_idx", "slope_pct", "v_glide", "v_flat_eq"]].head(30)
 )
 
-# Обобщена таблица след двете модулации
 full_summary = summarize_full(seg_glide, seg_slope)
 st.subheader("Обобщение по активности – след двете модулации (плъзгаемост + наклон)")
 st.dataframe(full_summary)
 
-# 9) СКОРОСТНИ ЗОНИ
+# 9) Скоростни зони
 seg_zones = assign_zones(seg_slope, V_crit_input)
 zone_summary = summarize_zones(seg_zones)
 
@@ -739,7 +719,7 @@ zone_summary_all = zone_summary.groupby("zone").agg(
 ).reset_index()
 st.dataframe(zone_summary_all)
 
-# 10) МОДЕЛ СКОРОСТ–ПУЛС И ПУЛСОВИ ЗОНИ
+# 10) Модел скорост–пулс и пулсови зони
 hr_poly, hr_agg, hr_coeffs = build_hr_speed_model(seg_slope)
 st.subheader("Модел скорост–пулс по активности")
 if hr_poly is None:
@@ -752,11 +732,9 @@ else:
     st.write("Средна v_flat_eq и среден пулс по активности (time-weighted):")
     st.dataframe(hr_agg)
 
-    # критичен пулс от модела
     HR_crit = float(hr_poly(V_crit_input)) if V_crit_input > 0 else None
     if HR_crit is not None:
-        st.write(f"Оценен критичен пулс при V_crit = {V_crit_input:.1f} km/h: "
-                 f"{HR_crit:.1f} bpm")
+        st.write(f"Оценен критичен пулс при V_crit = {V_crit_input:.1f} km/h: {HR_crit:.1f} bpm")
     else:
         st.write("Няма HR_crit (V_crit=0).")
 
@@ -779,7 +757,6 @@ else:
     )
     st.altair_chart(chart_pts_hr + chart_line_hr, use_container_width=True)
 
-    # пулсови зони по сегменти
     seg_hr_zones = assign_hr_zones(seg_slope, HR_crit)
     hr_zone_summary = summarize_hr_zones(seg_hr_zones)
     st.subheader("Обобщение по пулсови зони и активности")
@@ -789,33 +766,49 @@ else:
     hr_zone_summary_all = hr_zone_summary.groupby("zone_hr").agg(
         total_time_s=("total_time_s", "sum"),
         mean_hr=("mean_hr", "mean"),
-        mean_v_flat_eq=("mean_v_flat_eq", "mean"),
     ).reset_index()
     st.dataframe(hr_zone_summary_all)
 
-
-# 11) Детайлен изглед по активност: сегменти + скоростни / пулсови зони
+# 11) Детайлен изглед по активност + бар диаграми
 st.subheader("Детайлен изглед на сегментите по активност")
-act_list = sorted(seg_zones["activity"].unique())
+act_list = sorted(seg_hr_zones["activity"].unique())
 act_selected = st.selectbox("Избери активност (име на файла):", act_list)
 
 act_df = seg_hr_zones[seg_hr_zones["activity"] == act_selected].copy()
 st.write("Сегменти за избраната активност:")
-st.dataframe(
-    act_df[[
-        "activity", "seg_idx", "t_start", "dt_s", "d_m",
-        "slope_pct", "v_kmh", "K_glide", "v_glide",
-        "v_flat_eq", "rel_crit", "zone", "hr_mean", "rel_hr_crit", "zone_hr"
-    ]]
-)
 
+desired_cols = [
+    "activity", "seg_idx", "t_start", "dt_s", "d_m",
+    "slope_pct", "v_kmh", "K_glide", "v_glide",
+    "v_flat_eq", "rel_crit", "zone", "hr_mean",
+    "rel_hr_crit", "zone_hr"
+]
+available_cols = [c for c in desired_cols if c in act_df.columns]
+st.dataframe(act_df[available_cols])
+
+# скоростни зони за избраната активност
 st.write("Скоростни зони за избраната активност:")
 act_zone_summary = zone_summary[zone_summary["activity"] == act_selected].copy()
 st.dataframe(act_zone_summary)
 
+if not act_zone_summary.empty:
+    chart_speed_zones = alt.Chart(act_zone_summary).mark_bar().encode(
+        x=alt.X("zone:N", title="Скоростна зона"),
+        y=alt.Y("total_time_s:Q", title="Време [s]")
+    )
+    st.altair_chart(chart_speed_zones, use_container_width=True)
+
+# пулсови зони за избраната активност
 st.write("Пулсови зони за избраната активност:")
 act_hr_zone = hr_zone_summary[hr_zone_summary["activity"] == act_selected].copy()
 st.dataframe(act_hr_zone)
+
+if not act_hr_zone.empty:
+    chart_hr_zones = alt.Chart(act_hr_zone).mark_bar().encode(
+        x=alt.X("zone_hr:N", title="Пулсова зона"),
+        y=alt.Y("total_time_s:Q", title="Време [s]")
+    )
+    st.altair_chart(chart_hr_zones, use_container_width=True)
 
 # 12) Експорт – CSV
 st.subheader("Експорт на всички сегменти (CSV)")
@@ -833,4 +826,3 @@ st.download_button(
     file_name="segments_glide_slope_hr_zones.csv",
     mime="text/csv"
 )
-
