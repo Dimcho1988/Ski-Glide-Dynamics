@@ -817,8 +817,13 @@ export_cols = [
     "slope_pct", "v_kmh", "valid_basic", "K_glide", "v_glide",
     "v_flat_eq", "rel_crit", "zone", "hr_mean", "rel_hr_crit", "zone_hr"
 ]
-export_df = seg_hr_zones[export_cols].copy()
+
+# взимаме само колоните, които реално съществуват
+available_export_cols = [c for c in export_cols if c in seg_hr_zones.columns]
+export_df = seg_hr_zones[available_export_cols].copy()
+
 csv_data = export_df.to_csv(index=False).encode("utf-8")
+
 
 st.download_button(
     label="Свали сегментите като CSV",
