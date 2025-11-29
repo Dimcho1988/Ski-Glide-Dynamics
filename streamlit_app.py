@@ -744,15 +744,21 @@ hr_poly, hr_agg, hr_coeffs = build_hr_speed_model(seg_slope)
 st.subheader("Модел скорост–пулс по активности")
 if hr_poly is None:
     st.write("Няма достатъчно данни за модел скорост–пулс (или само една активност).")
+    HR_crit = None
+    seg_hr_zones = assign_hr_zones(seg_slope, HR_crit)
+    hr_zone_summary = summarize_hr_zones(seg_hr_zones)
 else:
     st.write("Коефициенти на линейния модел HR = a * V + b:", hr_poly.coefficients)
     st.write("Средна v_flat_eq и среден пулс по активности (time-weighted):")
     st.dataframe(hr_agg)
 
-    # критичен пулс
+    # критичен пулс от модела
     HR_crit = float(hr_poly(V_crit_input)) if V_crit_input > 0 else None
-    st.write(f"Оценен критичен пулс при V_crit = {V_crit_input:.1f} km/h: "
-             f"{HR_crit:.1f} bpm" if HR_crit is not None else "Няма HR_crit (V_crit=0).")
+    if HR_crit is not None:
+        st.write(f"Оценен критичен пулс при V_crit = {V_crit_input:.1f} km/h: "
+                 f"{HR_crit:.1f} bpm")
+    else:
+        st.write("Няма HR_crit (V_crit=0).")
 
     # визуализация HR(V)
     v_min = hr_agg["v_mean"].min()
@@ -786,10 +792,7 @@ else:
         mean_v_flat_eq=("mean_v_flat_eq", "mean"),
     ).reset_index()
     st.dataframe(hr_zone_summary_all)
-else:
-    HR_crit = None
-    seg_hr_zones = assign_hr_zones(seg_slope, HR_crit)
-    hr_zone_summary = summarize_hr_zones(seg_hr_zones)
+
 
 # 11) Детайлен изглед по активност: сегменти + скоростни / пулсови зони
 st.subheader("Детайлен изглед на сегментите по активност")
