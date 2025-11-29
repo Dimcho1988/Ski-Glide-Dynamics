@@ -257,7 +257,7 @@ def compute_glide_coefficients(seg, glide_poly):
     Връща dict activity -> K_glide.
     Логика:
     1) k_raw = V_model / V_real
-    2) клипваме k_raw в [0.9, 1.25]
+    2) клипваме k_raw в [0.90, 1.25]
     3) омекотяваме към 1 с коефициент DAMP_GLIDE:
        K = 1 + α * (k_clipped - 1)
     Така α влияе и върху крайностите.
