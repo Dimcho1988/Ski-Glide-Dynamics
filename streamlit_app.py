@@ -839,8 +839,14 @@ st.caption(
 
 # 6) Обобщена таблица по активности
 summary_df = build_activity_summary(
-    segments_f, train_glide, seg_glide, seg_slope, glide_coeffs
+    segments_f,
+    train_glide,
+    seg_glide,
+    seg_slope,
+    seg_slope_cs,
+    glide_coeffs
 )
+
 
 st.subheader("Обобщение по активности (след нормализация по наклон и плъзгаемост)")
 st.dataframe(summary_df, use_container_width=True)
