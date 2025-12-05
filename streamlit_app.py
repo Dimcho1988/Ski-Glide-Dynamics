@@ -524,22 +524,35 @@ def summarize_speed_zones(seg_zones):
     agg = agg.sort_values("zone")
     return agg
 
-
 def compute_zone_hr_from_counts(seg_df, zone_counts):
     """
-    seg_df: DataFrame с hr_mean, valid_basic
+    seg_df: DataFrame със сегментите (вкл. и тези с |slope| > 15%)
     zone_counts: dict {zone: n_segments}, на база скоростните зони.
+
     Алгоритъм:
-      - сортираме по hr_mean ↑
+      - филтрираме само:
+          * сегменти без speed_spike
+          * сегменти с наличен hr_mean
+      - сортираме тези сегменти по hr_mean ↑
       - за Z1 взимаме първите N1, за Z2 – следващите N2, ...
     """
-    df_hr = seg_df[seg_df["valid_basic"]].dropna(subset=["hr_mean"]).copy()
+
+    # 1) махаме спайковете по скорост и сегментите без пулс
+    df_hr = seg_df.copy()
+    if "speed_spike" in df_hr.columns:
+        df_hr = df_hr[~df_hr["speed_spike"].fillna(False)]
+
+    df_hr = df_hr.dropna(subset=["hr_mean"]).copy()
+
     if df_hr.empty:
+        # връщаме празни стойности за всички зони
         rows = [{"zone": z, "mean_hr_zone": np.nan} for z in ZONE_NAMES]
         return pd.DataFrame(rows)
 
+    # 2) сортираме по пулс (от най-нисък към най-висок)
     df_hr = df_hr.sort_values("hr_mean").reset_index(drop=True)
 
+    # 3) разпределяме по твоята методика: N1 най-ниски за Z1, следващите N2 за Z2 и т.н.
     results = []
     start_idx = 0
     for z in ZONE_NAMES:
@@ -547,10 +560,12 @@ def compute_zone_hr_from_counts(seg_df, zone_counts):
         if n <= 0 or start_idx >= len(df_hr):
             results.append({"zone": z, "mean_hr_zone": np.nan})
             continue
+
         end_idx = min(start_idx + n, len(df_hr))
         subset = df_hr.iloc[start_idx:end_idx]
         mean_hr = subset["hr_mean"].mean() if not subset.empty else np.nan
         results.append({"zone": z, "mean_hr_zone": mean_hr})
+
         start_idx = end_idx
 
     return pd.DataFrame(results)
