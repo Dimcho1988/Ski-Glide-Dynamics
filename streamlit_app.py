@@ -834,6 +834,13 @@ else:
     slope_poly = np.poly1d(coeffs)
     seg_slope = apply_slope_modulation(seg_glide, slope_poly, V_crit)
 
+# 5a) Почистване на v_flat_eq от нереалистични спайкове
+seg_slope = seg_slope.sort_values(["activity", "t_start"]).reset_index(drop=True)
+for act, g_act in seg_slope.groupby("activity"):
+    v_clean = clean_speed_for_cs(g_act, v_max_cs=50.0)
+    seg_slope.loc[g_act.index, "v_flat_eq"] = v_clean
+
+
 # 5b) CS модулация върху v_flat_eq
 if do_calibrate:
     k_par = calibrate_k_for_target_t90(CS, ref_percent, tau_min, q_par, target_t90)
