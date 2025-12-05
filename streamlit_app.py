@@ -534,8 +534,12 @@ else:
     # изместване така, че F(0)=1
     F0 = float(raw_slope_poly(0.0))
     offset = F0 - 1.0
-    slope_poly = np.poly1d(raw_slope_poly.coefficients)
-    slope_poly[-1] -= offset  # сега slope_poly(0) = 1
+
+    # взимаме копие на коефициентите и коригираме свободния член
+    coeffs = raw_slope_poly.coefficients.copy()
+    coeffs[-1] -= offset           # последният е свободният член (s^0)
+    slope_poly = np.poly1d(coeffs) # нов полином с F(0) = 1
+
     seg_slope = apply_slope_modulation(seg_glide, slope_poly, V_CRIT)
 
 # 6) Обобщена таблица по активности
