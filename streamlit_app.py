@@ -418,7 +418,14 @@ def apply_slope_modulation(seg_glide, slope_poly, V_crit):
 # ---------------------------------------------------------
 # ОБОБЩЕНИЕ ЗА UI ТАБЛИЦАТА ПО АКТИВНОСТИ
 # ---------------------------------------------------------
-def build_activity_summary(segments_f, train_glide, seg_glide, seg_slope, seg_slope_cs, glide_coeffs):
+def build_activity_summary(
+    segments_f,
+    train_glide,
+    seg_glide,
+    seg_slope,
+    seg_slope_cs,
+    glide_coeffs
+):
     activities = sorted(segments_f["activity"].unique())
     summary = pd.DataFrame({"activity": activities})
 
@@ -461,16 +468,16 @@ def build_activity_summary(segments_f, train_glide, seg_glide, seg_slope, seg_sl
     ).reset_index()
     summary = summary.merge(slope_agg, on="activity", how="left")
 
-    # 6) Средна скорост след CS модулация (v_flat_eq_cs)
+    # 6) Средна скорост след CS модулация
     cs_agg = seg_slope_cs[seg_slope_cs["valid_basic"]].groupby("activity").agg(
         v_flat_cs_mean=("v_flat_eq_cs", "mean")
     ).reset_index()
     summary = summary.merge(cs_agg, on="activity", how="left")
 
-    # 7) Ефективен коефициент от наклона
+    # 7) Ефективен коефициент наклон
     summary["K_slope_eff"] = summary["v_flat_mean"] / summary["v_glide_mean"]
 
-    # Подреждане на колоните
+    # Подреждаме колоните
     summary = summary[
         [
             "activity",
@@ -499,7 +506,6 @@ def build_activity_summary(segments_f, train_glide, seg_glide, seg_slope, seg_sl
     })
 
     return summary
-
 
 # ---------------------------------------------------------
 # ЗОНИ ПО СКОРОСТ И ПУЛС (по твоята методика)
