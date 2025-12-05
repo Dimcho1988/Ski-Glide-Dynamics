@@ -845,11 +845,13 @@ seg_slope["time_s"] = seg_slope.groupby("activity")["dt_s"].cumsum() - seg_slope
 
 cs_rows = []
 for act, g in seg_slope.groupby("activity"):
-    v = g["v_flat_eq"].to_numpy(dtype=float)
+    # 1) чистим скоростта: режем над v_max_cs и изглаждаме спайковете
+    v_clean = clean_speed_for_cs(g, v_max_cs=50.0)
     dt_arr = g["dt_s"].to_numpy(dtype=float)
 
+    # 2) прилагаме CS модела върху изчистената скорост
     out_cs = apply_cs_modulation(
-        v=v,
+        v=v_clean,
         dt=dt_arr,
         CS=CS,
         tau_min=tau_min,
