@@ -820,6 +820,30 @@ do_calibrate = st.sidebar.button(
         "процент от CS, моделът да дава посоченото t₉₀."
     ),
 )
+uploaded_files = st.file_uploader(
+    "Качи един или няколко TCX файла:",
+    type=["tcx"],
+    accept_multiple_files=True
+)
+
+if not uploaded_files:
+    st.info("Качи поне един TCX файл, за да започнем.")
+    st.stop()
+
+# 1) Парсване на файловете
+all_points = []
+for f in uploaded_files:
+    label = f.name
+    df_act = parse_tcx(f, label)
+    if df_act.empty:
+        continue
+    all_points.append(df_act)
+
+if not all_points:
+    st.error("Не успях да извлека данни от файловете.")
+    st.stop()
+
+points = pd.concat(all_points, ignore_index=True)
 
 
 # 2) Сегментиране
