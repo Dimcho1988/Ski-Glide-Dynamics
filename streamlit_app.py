@@ -82,6 +82,43 @@ def seconds_to_hhmmss(seconds: float) -> str:
     m = (s % 3600) // 60
     sec = s % 60
     return f"{h}:{m:02d}:{sec:02d}"
+def clean_speed_for_cs(g, v_max_cs=50.0):
+    """
+    Чисти скоростта преди CS-модулацията:
+      - клипва v_flat_eq в [0, v_max_cs]
+      - за сегментите със speed_spike=True прави линейна интерполация
+        между най-близките 'чисти' сегменти.
+    g е под-DataFrame за дадена активност.
+    """
+    v = g["v_flat_eq"].to_numpy(dtype=float)
+
+    # 1) глобален клип – отрязваме абсурдни стойности
+    v = np.clip(v, 0.0, v_max_cs)
+
+    # 2) интерполация върху спайковете
+    if "speed_spike" in g.columns:
+        is_spike = g["speed_spike"].to_numpy(dtype=bool)
+    else:
+        is_spike = np.zeros_like(v, dtype=bool)
+
+    if not is_spike.any():
+        return v  # няма спайкове
+
+    v_clean = v.copy()
+    idx = np.arange(len(v_clean))
+
+    good = ~is_spike
+    if good.sum() == 0:
+        # в крайен случай – ако всичко е спайк, връщаме оригинала
+        return v_clean
+    if good.sum() == 1:
+        # само една добра точка – всички спайкове стават равни на нея
+        v_clean[is_spike] = v_clean[good][0]
+        return v_clean
+
+    # линейна интерполация по индекса
+    v_clean[is_spike] = np.interp(idx[is_spike], idx[good], v_clean[good])
+    return v_clean
 
 
 # ---------------------------------------------------------
