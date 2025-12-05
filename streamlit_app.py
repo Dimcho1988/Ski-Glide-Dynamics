@@ -7,6 +7,12 @@ from datetime import datetime
 import math
 import altair as alt
 
+from cs_modulator import (
+    apply_cs_modulation,
+    calibrate_k_for_target_t90,
+    predict_t90_for_reference,
+)
+
 # ---------------------------------------------------------
 # НАСТРОЙКИ (фиксирани прагове, но V_crit и DAMP_GLIDE са в UI)
 # ---------------------------------------------------------
@@ -524,6 +530,7 @@ def summarize_speed_zones(seg_zones):
     agg = agg.sort_values("zone")
     return agg
 
+
 def compute_zone_hr_from_counts(seg_df, zone_counts):
     """
     seg_df: DataFrame със сегментите (вкл. и тези с |slope| > 15%)
@@ -536,8 +543,6 @@ def compute_zone_hr_from_counts(seg_df, zone_counts):
       - сортираме тези сегменти по hr_mean ↑
       - за Z1 взимаме първите N1, за Z2 – следващите N2, ...
     """
-
-    # 1) махаме спайковете по скорост и сегментите без пулс
     df_hr = seg_df.copy()
     if "speed_spike" in df_hr.columns:
         df_hr = df_hr[~df_hr["speed_spike"].fillna(False)]
@@ -545,14 +550,11 @@ def compute_zone_hr_from_counts(seg_df, zone_counts):
     df_hr = df_hr.dropna(subset=["hr_mean"]).copy()
 
     if df_hr.empty:
-        # връщаме празни стойности за всички зони
         rows = [{"zone": z, "mean_hr_zone": np.nan} for z in ZONE_NAMES]
         return pd.DataFrame(rows)
 
-    # 2) сортираме по пулс (от най-нисък към най-висок)
     df_hr = df_hr.sort_values("hr_mean").reset_index(drop=True)
 
-    # 3) разпределяме по твоята методика: N1 най-ниски за Z1, следващите N2 за Z2 и т.н.
     results = []
     start_idx = 0
     for z in ZONE_NAMES:
@@ -560,12 +562,10 @@ def compute_zone_hr_from_counts(seg_df, zone_counts):
         if n <= 0 or start_idx >= len(df_hr):
             results.append({"zone": z, "mean_hr_zone": np.nan})
             continue
-
         end_idx = min(start_idx + n, len(df_hr))
         subset = df_hr.iloc[start_idx:end_idx]
         mean_hr = subset["hr_mean"].mean() if not subset.empty else np.nan
         results.append({"zone": z, "mean_hr_zone": mean_hr})
-
         start_idx = end_idx
 
     return pd.DataFrame(results)
@@ -600,7 +600,6 @@ def build_zone_speed_hr_table(seg_zones, V_crit, activity=None):
 
     merged = pd.merge(speed_summary, hr_summary, on="zone", how="left")
 
-    # добавяме форматирано време
     merged["time_hhmmss"] = merged["total_time_s"].apply(seconds_to_hhmmss)
 
     merged = merged.rename(columns={
@@ -611,7 +610,6 @@ def build_zone_speed_hr_table(seg_zones, V_crit, activity=None):
         "mean_hr_zone": "Среден пулс [bpm]",
     })
 
-    # подреждаме колоните
     merged = merged[[
         "Зона", "Брой сегменти", "Време [ч:мм:сс]",
         "Средна скорост [km/h]", "Среден пулс [bpm]"
@@ -621,13 +619,13 @@ def build_zone_speed_hr_table(seg_zones, V_crit, activity=None):
 
 
 # ---------------------------------------------------------
-# STREAMLIT APP – ИЗЧИСТЕН UI + КОНТРОЛЕН ПАНЕЛ
+# STREAMLIT APP – ИЗЧИСТЕН UI + КОНТРОЛЕН ПАНЕЛ + CS МОДЕЛ
 # ---------------------------------------------------------
 st.set_page_config(page_title="Ski Glide & Slope Model", layout="wide")
-st.title("Модел за плъзгаемост и наклон при ски бягане")
+st.title("Модел за плъзгаемост, наклон и кислороден дълг при ски бягане")
 
-# Контролен панел за омекотяване и критична скорост
-st.sidebar.header("Параметри на модела")
+# ---------- Sidebar: основни параметри ----------
+st.sidebar.header("Параметри на наклона и плъзгаемостта")
 
 V_crit = st.sidebar.number_input(
     "Критична скорост V_crit [km/h]",
@@ -645,7 +643,76 @@ DAMP_GLIDE = st.sidebar.slider(
     step=0.05
 )
 
-st.caption(f"Текущи параметри: V_crit = {V_crit:.1f} km/h, α (DAMP_GLIDE) = {DAMP_GLIDE:.2f}")
+st.sidebar.markdown("---")
+
+# ---------- Sidebar: CS / кислороден дълг ----------
+st.sidebar.header("CS модел (кислороден „дълг“)")
+use_vcrit_as_cs = st.sidebar.checkbox("Използвай V_crit като CS", value=True)
+
+if use_vcrit_as_cs:
+    CS = V_crit
+else:
+    CS = st.sidebar.number_input(
+        "Критична скорост CS [km/h]",
+        min_value=5.0,
+        max_value=40.0,
+        value=18.0,
+        step=0.5
+    )
+
+tau_min = st.sidebar.number_input(
+    "τ_min (s) – минимална константа",
+    min_value=5.0,
+    max_value=120.0,
+    value=25.0,
+    step=1.0
+)
+
+k_par = st.sidebar.number_input(
+    "k – растеж на τ с отклонението",
+    min_value=0.0,
+    max_value=500.0,
+    value=35.0,
+    step=1.0
+)
+
+q_par = st.sidebar.number_input(
+    "q – нелинейност на τ(Δv)",
+    min_value=0.1,
+    max_value=3.0,
+    value=1.3,
+    step=0.1
+)
+
+gamma_cs = st.sidebar.slider(
+    "γ – каква част от ликвидацията „повдига“ скоростта",
+    min_value=0.0,
+    max_value=1.0,
+    value=1.0,
+    step=0.05
+)
+
+st.sidebar.subheader("Калибрация по референтен сценарий")
+ref_percent = st.sidebar.number_input(
+    "Референтна интензивност (% от CS)",
+    min_value=101.0,
+    max_value=200.0,
+    value=105.0,
+    step=0.5
+)
+target_t90 = st.sidebar.number_input(
+    "Желано t₉₀ (s)",
+    min_value=10.0,
+    max_value=1200.0,
+    value=60.0,
+    step=5.0
+)
+do_calibrate = st.sidebar.button("Приложи калибрация (пресметни k)")
+
+st.caption(
+    f"Текущи параметри: V_crit = {V_crit:.1f} km/h, CS = {CS:.1f} km/h, "
+    f"α (DAMP_GLIDE) = {DAMP_GLIDE:.2f}"
+)
 
 uploaded_files = st.file_uploader(
     "Качи един или няколко TCX файла:",
@@ -714,12 +781,52 @@ else:
     slope_poly = np.poly1d(coeffs)
     seg_slope = apply_slope_modulation(seg_glide, slope_poly, V_crit)
 
+# 5b) CS модулация върху v_flat_eq
+if do_calibrate:
+    k_par = calibrate_k_for_target_t90(CS, ref_percent, tau_min, q_par, target_t90)
+    st.sidebar.success(f"Нов k = {k_par:.2f} (приложен)")
+
+# добавяме time_s (кумулативно) по активност
+seg_slope = seg_slope.sort_values(["activity", "t_start"]).reset_index(drop=True)
+seg_slope["time_s"] = seg_slope.groupby("activity")["dt_s"].cumsum() - seg_slope["dt_s"]
+
+cs_rows = []
+for act, g in seg_slope.groupby("activity"):
+    v = g["v_flat_eq"].to_numpy(dtype=float)
+    dt_arr = g["dt_s"].to_numpy(dtype=float)
+
+    out_cs = apply_cs_modulation(
+        v=v,
+        dt=dt_arr,
+        CS=CS,
+        tau_min=tau_min,
+        k_par=k_par,
+        q_par=q_par,
+        gamma=gamma_cs,
+    )
+
+    g_cs = g.copy()
+    g_cs["v_flat_eq_cs"] = out_cs["v_mod"]
+    g_cs["delta_v_plus_kmh"] = out_cs["delta_v_plus"]
+    g_cs["r_kmh"] = out_cs["r"]
+    g_cs["tau_s"] = out_cs["tau_s"]
+    cs_rows.append(g_cs)
+
+seg_slope_cs = pd.concat(cs_rows, ignore_index=True)
+
+# CS диагностична метрика t90 за референтния сценарий
+dv_ref, tau_ref_now, t90_now = predict_t90_for_reference(CS, ref_percent, tau_min, k_par, q_par)
+st.caption(
+    f"CS модел: Δv_ref = {dv_ref:.2f} km/h, τ_ref ≈ {tau_ref_now:.1f} s, "
+    f"t₉₀ ≈ {t90_now:.0f} s при {ref_percent:.1f}% от CS."
+)
+
 # 6) Обобщена таблица по активности
 summary_df = build_activity_summary(
     segments_f, train_glide, seg_glide, seg_slope, glide_coeffs
 )
 
-st.subheader("Обобщение по активности")
+st.subheader("Обобщение по активности (след нормализация по наклон и плъзгаемост)")
 st.dataframe(summary_df, use_container_width=True)
 
 # ---------------------------------------------------------
@@ -780,44 +887,98 @@ else:
     st.info("Няма достатъчно данни за изграждане на модел за наклона.")
 
 # ---------------------------------------------------------
+# ГРАФИКА 3 – CS модулация върху v_flat_eq
+# ---------------------------------------------------------
+st.subheader("CS модулация на еквивалентната скорост (по активности)")
+
+act_list = sorted(seg_slope_cs["activity"].unique())
+act_cs_selected = st.selectbox(
+    "Избери активност за CS-графика:",
+    act_list,
+    key="cs_act_select"
+)
+
+g_plot = seg_slope_cs[seg_slope_cs["activity"] == act_cs_selected].copy()
+
+if not g_plot.empty:
+    base = alt.Chart(g_plot).encode(
+        x=alt.X("time_s:Q", title="Време [s]")
+    )
+
+    line_orig = base.mark_line().encode(
+        y=alt.Y("v_flat_eq:Q", title="Скорост [km/h]"),
+        color=alt.value("#1f77b4")
+    )
+    line_cs = base.mark_line(strokeDash=[4, 4]).encode(
+        y="v_flat_eq_cs:Q",
+        color=alt.value("#ff7f0e")
+    )
+
+    st.altair_chart(line_orig + line_cs, use_container_width=True)
+
+    st.caption("Плътна линия – v_flat_eq (само наклон+плъзгаемост); "
+               "пунктирана – v_flat_eq_cs (допълнително CS-модулирана).")
+
+# ---------------------------------------------------------
 # ЗОНИ – СКОРОСТ + ПУЛС (ВСИЧКИ АКТИВНОСТИ)
 # ---------------------------------------------------------
 seg_zones = assign_speed_zones(seg_slope, V_crit)
 
-st.subheader("Разпределение по зони – скорост и пулс (всички активности)")
+st.subheader("Разпределение по зони – скорост и пулс (всички активности, без CS)")
 zone_table_all = build_zone_speed_hr_table(seg_zones, V_crit, activity=None)
 st.dataframe(zone_table_all, use_container_width=True)
+
+# CS-зони: използваме v_flat_eq_cs като v_flat_eq
+seg_slope_cs_for_zones = seg_slope_cs.copy()
+seg_slope_cs_for_zones["v_flat_eq"] = seg_slope_cs_for_zones["v_flat_eq_cs"]
+seg_zones_cs = assign_speed_zones(seg_slope_cs_for_zones, V_crit)
+
+st.subheader("Разпределение по зони – скорост и пулс (всички активности, с CS)")
+zone_table_all_cs = build_zone_speed_hr_table(seg_zones_cs, V_crit, activity=None)
+st.dataframe(zone_table_all_cs, use_container_width=True)
 
 # ---------------------------------------------------------
 # ЗОНИ – СКОРОСТ + ПУЛС (ИЗБРАНА АКТИВНОСТ)
 # ---------------------------------------------------------
 st.subheader("Разпределение по зони – скорост и пулс (избрана активност)")
 
-act_list = sorted(seg_zones["activity"].unique())
-act_selected = st.selectbox("Избери активност:", act_list)
+act_selected = st.selectbox(
+    "Избери активност за зонен анализ:",
+    act_list,
+    key="zone_act_select"
+)
 
 zone_table_act = build_zone_speed_hr_table(seg_zones, V_crit, activity=act_selected)
+st.markdown("**Без CS модулация:**")
 st.dataframe(zone_table_act, use_container_width=True)
+
+zone_table_act_cs = build_zone_speed_hr_table(seg_zones_cs, V_crit, activity=act_selected)
+st.markdown("**С CS модулация:**")
+st.dataframe(zone_table_act_cs, use_container_width=True)
 
 # ---------------------------------------------------------
 # ЕКСПОРТ НА СЕГМЕНТИТЕ
 # ---------------------------------------------------------
-st.subheader("Експорт на сегментите (след двете модулации)")
+st.subheader("Експорт на сегментите (след двете модулации + CS)")
 
 export_cols = [
     "activity", "seg_idx", "t_start", "t_end", "dt_s", "d_m",
-    "slope_pct", "v_kmh", "valid_basic", "K_glide", "v_glide",
-    "v_flat_eq", "hr_mean", "rel_crit", "zone"
+    "slope_pct", "v_kmh", "valid_basic", "speed_spike",
+    "K_glide", "v_glide",
+    "v_flat_eq", "v_flat_eq_cs",
+    "time_s",
+    "delta_v_plus_kmh", "r_kmh", "tau_s",
+    "hr_mean"
 ]
-available_export_cols = [c for c in export_cols if c in seg_zones.columns]
-export_df = seg_zones[available_export_cols].copy()
+
+available_export_cols = [c for c in export_cols if c in seg_slope_cs.columns]
+export_df = seg_slope_cs[available_export_cols].copy()
 
 csv_data = export_df.to_csv(index=False).encode("utf-8")
 
 st.download_button(
     label="Свали сегментите като CSV",
     data=csv_data,
-    file_name="segments_glide_slope_zones.csv",
+    file_name="segments_glide_slope_cs_mod.csv",
     mime="text/csv"
 )
-
