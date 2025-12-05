@@ -8,7 +8,7 @@ import math
 import altair as alt
 
 # ---------------------------------------------------------
-# НАСТРОЙКИ ПО ПОДРАЗБИРАНЕ (фиксирани – не се показват в UI)
+# НАСТРОЙКИ (фиксирани – ако искаш, лесно се правят в UI)
 # ---------------------------------------------------------
 T_SEG = 7.0            # дължина на сегмента [s]
 MIN_D_SEG = 5.0        # минимум хоризонтална дистанция [m]
@@ -17,11 +17,15 @@ MAX_ABS_SLOPE = 15.0   # макс. наклон [%]
 V_JUMP_KMH = 15.0      # праг за "скачане" на скоростта между сегменти
 V_JUMP_MIN = 20.0      # гледаме спайкове само над тази скорост [km/h]
 
-GLIDE_POLY_DEG = 2     # степен на полинома за плъзгаемост (1 или 2)
-SLOPE_POLY_DEG = 2     # степен на полинома за наклон (1 или 2)
+GLIDE_POLY_DEG = 2     # степен на полинома за плъзгаемост
+SLOPE_POLY_DEG = 2     # степен на полинома за наклон
 DAMP_GLIDE = 1.0       # омекотяване на коефициента на плъзгаемост (0–1)
 
-V_CRIT = 20.0          # фиксирана критична скорост [km/h] – нужна за силни спускания
+V_CRIT = 20.0          # критична скорост [km/h] за зони и силни спускания
+
+# Зонна система като % от критичната скорост
+ZONE_BOUNDS = [0.0, 0.75, 0.85, 0.95, 1.05, 1.15, np.inf]
+ZONE_NAMES = ["Z1", "Z2", "Z3", "Z4", "Z5", "Z6"]
 
 
 # ---------------------------------------------------------
@@ -60,7 +64,6 @@ def poly_to_str(poly, var="s"):
         return (f"{fmt_coef(a)}·{var} "
                 f"{'+ ' if b >= 0 else '- '}{fmt_coef(abs(b))}")
     else:
-        # общ случай – просто показваме коефициентите
         return " + ".join(
             f"{fmt_coef(c)}·{var}^{p}"
             for p, c in zip(range(deg, -1, -1), coeffs)
@@ -68,7 +71,7 @@ def poly_to_str(poly, var="s"):
 
 
 # ---------------------------------------------------------
-# TCX PARSER
+# TCX PARSER – с пулс
 # ---------------------------------------------------------
 def parse_tcx(file, activity_label):
     content = file.read()
@@ -100,6 +103,9 @@ def parse_tcx(file, activity_label):
             dist_el = tp.find("tcx:DistanceMeters", ns)
             dist = float(dist_el.text) if dist_el is not None else None
 
+            hr_el = tp.find(".//tcx:HeartRateBpm/tcx:Value", ns)
+            hr = float(hr_el.text) if hr_el is not None else np.nan
+
             rows.append({
                 "activity": activity_label,
                 "time": time,
@@ -107,10 +113,11 @@ def parse_tcx(file, activity_label):
                 "lon": lon,
                 "elev": elev,
                 "dist": dist,
+                "hr": hr,
             })
 
     if not rows:
-        return pd.DataFrame(columns=["activity", "time", "lat", "lon", "elev", "dist"])
+        return pd.DataFrame(columns=["activity", "time", "lat", "lon", "elev", "dist", "hr"])
 
     df = pd.DataFrame(rows)
     df.sort_values("time", inplace=True)
@@ -135,13 +142,13 @@ def parse_tcx(file, activity_label):
 
 
 # ---------------------------------------------------------
-# СЕГМЕНТИРАНЕ НА 7 s
+# СЕГМЕНТИРАНЕ НА 7 s (с hr_mean)
 # ---------------------------------------------------------
 def build_segments(df_activity, activity_label):
     if df_activity.empty:
         return pd.DataFrame(columns=[
             "activity", "seg_idx", "t_start", "t_end", "dt_s", "d_m",
-            "slope_pct", "v_kmh"
+            "slope_pct", "v_kmh", "hr_mean"
         ])
 
     df_activity = df_activity.sort_values("time").reset_index(drop=True)
@@ -149,6 +156,7 @@ def build_segments(df_activity, activity_label):
     times = df_activity["time"].to_numpy()
     elevs = df_activity["elev"].to_numpy()
     dists = df_activity["dist"].to_numpy()
+    hrs = df_activity["hr"].to_numpy()
 
     n = len(df_activity)
     start_idx = 0
@@ -187,6 +195,7 @@ def build_segments(df_activity, activity_label):
             slope = (elev1 - elev0) / d_m * 100.0 if d_m > 0 else np.nan
 
         v_kmh = (d_m / dt) * 3.6
+        hr_mean = float(np.nanmean(hrs[start_idx:end_idx + 1]))
 
         seg_rows.append({
             "activity": activity_label,
@@ -197,6 +206,7 @@ def build_segments(df_activity, activity_label):
             "d_m": float(d_m),
             "slope_pct": float(slope) if not np.isnan(slope) else np.nan,
             "v_kmh": float(v_kmh),
+            "hr_mean": hr_mean
         })
 
         seg_idx += 1
@@ -205,7 +215,7 @@ def build_segments(df_activity, activity_label):
     if not seg_rows:
         return pd.DataFrame(columns=[
             "activity", "seg_idx", "t_start", "t_end", "dt_s", "d_m",
-            "slope_pct", "v_kmh"
+            "slope_pct", "v_kmh", "hr_mean"
         ])
 
     return pd.DataFrame(seg_rows)
@@ -392,7 +402,7 @@ def apply_slope_modulation(seg_glide, slope_poly, V_crit):
 
 
 # ---------------------------------------------------------
-# ОБОБЩЕНИЕ ЗА UI ТАБЛИЦАТА
+# ОБОБЩЕНИЕ ЗА UI ТАБЛИЦАТА ПО АКТИВНОСТИ
 # ---------------------------------------------------------
 def build_activity_summary(segments_f, train_glide, seg_glide, seg_slope, glide_coeffs):
     activities = sorted(segments_f["activity"].unique())
@@ -410,11 +420,14 @@ def build_activity_summary(segments_f, train_glide, seg_glide, seg_slope, glide_
         summary["v_glide_train_mean"] = np.nan
 
     # 2) Коефициент K_glide по активност
-    K_glide_df = pd.DataFrame(
-        {"activity": list(glide_coeffs.keys()),
-         "K_glide": list(glide_coeffs.values())}
-    )
-    summary = summary.merge(K_glide_df, on="activity", how="left")
+    if glide_coeffs:
+        K_glide_df = pd.DataFrame(
+            {"activity": list(glide_coeffs.keys()),
+             "K_glide": list(glide_coeffs.values())}
+        )
+        summary = summary.merge(K_glide_df, on="activity", how="left")
+    else:
+        summary["K_glide"] = np.nan
 
     # 3) Реална средна скорост (преди модулации)
     real_agg = segments_f[segments_f["valid_basic"]].groupby("activity").agg(
@@ -437,7 +450,6 @@ def build_activity_summary(segments_f, train_glide, seg_glide, seg_slope, glide_
     # 6) Ефективен коефициент от наклона
     summary["K_slope_eff"] = summary["v_flat_mean"] / summary["v_glide_mean"]
 
-    # Подреждаме колоните
     summary = summary[
         [
             "activity",
@@ -451,7 +463,6 @@ def build_activity_summary(segments_f, train_glide, seg_glide, seg_slope, glide_
         ]
     ]
 
-    # Преименуваме колоните за UI (български етикети)
     summary = summary.rename(columns={
         "activity": "Активност",
         "slope_glide_mean": "Среден наклон на спусканията за модел [%]",
@@ -467,10 +478,123 @@ def build_activity_summary(segments_f, train_glide, seg_glide, seg_slope, glide_
 
 
 # ---------------------------------------------------------
-# STREAMLIT APP – ИЗЧИСТЕН UI
+# ЗОНИ ПО СКОРОСТ И ПУЛС (по твоята методика)
+# ---------------------------------------------------------
+def assign_speed_zones(seg_slope, V_crit):
+    df = seg_slope.copy()
+    if V_crit is None or V_crit <= 0:
+        df["rel_crit"] = np.nan
+        df["zone"] = None
+        return df
+
+    df["rel_crit"] = df["v_flat_eq"] / V_crit
+
+    zones = []
+    for r in df["rel_crit"]:
+        if pd.isna(r):
+            zones.append(None)
+            continue
+        z_name = None
+        for i in range(len(ZONE_NAMES)):
+            if ZONE_BOUNDS[i] <= r < ZONE_BOUNDS[i + 1]:
+                z_name = ZONE_NAMES[i]
+                break
+        zones.append(z_name)
+    df["zone"] = zones
+    return df
+
+
+def summarize_speed_zones(seg_zones):
+    df = seg_zones.dropna(subset=["zone"]).copy()
+    if df.empty:
+        return pd.DataFrame(columns=["zone", "n_segments", "total_time_s", "mean_v_flat_eq"])
+    agg = df.groupby("zone").agg(
+        n_segments=("seg_idx", "count"),
+        total_time_s=("dt_s", "sum"),
+        mean_v_flat_eq=("v_flat_eq", "mean"),
+    ).reset_index()
+    agg = agg.sort_values("zone")
+    return agg
+
+
+def compute_zone_hr_from_counts(seg_df, zone_counts):
+    """
+    seg_df: DataFrame с hr_mean, valid_basic
+    zone_counts: dict {zone: n_segments}, на база скоростните зони.
+    Алгоритъм:
+      - сортираме по hr_mean ↑
+      - за Z1 взимаме първите N1, за Z2 – следващите N2, ...
+    """
+    df_hr = seg_df[seg_df["valid_basic"]].dropna(subset=["hr_mean"]).copy()
+    if df_hr.empty:
+        rows = [{"zone": z, "mean_hr_zone": np.nan} for z in ZONE_NAMES]
+        return pd.DataFrame(rows)
+
+    df_hr = df_hr.sort_values("hr_mean").reset_index(drop=True)
+
+    results = []
+    start_idx = 0
+    for z in ZONE_NAMES:
+        n = int(zone_counts.get(z, 0))
+        if n <= 0 or start_idx >= len(df_hr):
+            results.append({"zone": z, "mean_hr_zone": np.nan})
+            continue
+        end_idx = min(start_idx + n, len(df_hr))
+        subset = df_hr.iloc[start_idx:end_idx]
+        mean_hr = subset["hr_mean"].mean() if not subset.empty else np.nan
+        results.append({"zone": z, "mean_hr_zone": mean_hr})
+        start_idx = end_idx
+
+    return pd.DataFrame(results)
+
+
+def build_zone_speed_hr_table(seg_zones, V_crit, activity=None):
+    """
+    Връща таблица по зони:
+      zone | n_segments | total_time_s | mean_v_flat_eq | mean_hr_zone
+    Ако activity е None -> всички активности.
+    """
+    if activity is not None:
+        df = seg_zones[seg_zones["activity"] == activity].copy()
+    else:
+        df = seg_zones.copy()
+
+    if df.empty:
+        return pd.DataFrame(columns=[
+            "Зона", "Брой сегменти", "Време [s]",
+            "Средна скорост [km/h]", "Среден пулс [bpm]"
+        ])
+
+    speed_summary = summarize_speed_zones(df)
+    if speed_summary.empty:
+        return pd.DataFrame(columns=[
+            "Зона", "Брой сегменти", "Време [s]",
+            "Средна скорост [km/h]", "Среден пулс [bpm]"
+        ])
+
+    zone_counts = dict(zip(speed_summary["zone"], speed_summary["n_segments"]))
+    hr_summary = compute_zone_hr_from_counts(df, zone_counts)
+
+    merged = pd.merge(speed_summary, hr_summary, on="zone", how="left")
+
+    merged = merged.rename(columns={
+        "zone": "Зона",
+        "n_segments": "Брой сегменти",
+        "total_time_s": "Време [s]",
+        "mean_v_flat_eq": "Средна скорост [km/h]",
+        "mean_hr_zone": "Среден пулс [bpm]",
+    })
+
+    return merged
+
+
+# ---------------------------------------------------------
+# STREAMLIT APP – ИЗЧИСТЕН UI + ЗОНИ
 # ---------------------------------------------------------
 st.set_page_config(page_title="Ski Glide & Slope Model", layout="wide")
 st.title("Модел за плъзгаемост и наклон при ски бягане")
+
+st.caption(f"Параметри на модела: V_crit = {V_CRIT:.1f} km/h, α (DAMP_GLIDE) = {DAMP_GLIDE:.2f}")
 
 uploaded_files = st.file_uploader(
     "Качи един или няколко TCX файла:",
@@ -501,7 +625,8 @@ points = pd.concat(all_points, ignore_index=True)
 seg_list = []
 for act, g in points.groupby("activity"):
     seg_df = build_segments(g, act)
-    seg_list.append(seg_df)
+    if not seg_df.empty:
+        seg_list.append(seg_df)
 
 segments = pd.concat(seg_list, ignore_index=True) if seg_list else pd.DataFrame()
 if segments.empty:
@@ -522,7 +647,7 @@ else:
     glide_coeffs = compute_glide_coefficients(segments_f, glide_poly)
     seg_glide = apply_glide_modulation(segments_f, glide_coeffs)
 
-# 5) Модел за наклон
+# 5) Модел за наклон (F(0)=1)
 flat_refs = compute_flat_ref_speeds(seg_glide)
 slope_train = get_slope_training_data(seg_glide, flat_refs)
 raw_slope_poly = fit_slope_poly(slope_train)
@@ -531,15 +656,11 @@ if raw_slope_poly is None:
     slope_poly = None
     seg_slope = apply_slope_modulation(seg_glide, slope_poly, V_CRIT)
 else:
-    # изместване така, че F(0)=1
     F0 = float(raw_slope_poly(0.0))
     offset = F0 - 1.0
-
-    # взимаме копие на коефициентите и коригираме свободния член
     coeffs = raw_slope_poly.coefficients.copy()
-    coeffs[-1] -= offset           # последният е свободният член (s^0)
-    slope_poly = np.poly1d(coeffs) # нов полином с F(0) = 1
-
+    coeffs[-1] -= offset  # корекция на свободния член => F(0)=1
+    slope_poly = np.poly1d(coeffs)
     seg_slope = apply_slope_modulation(seg_glide, slope_poly, V_CRIT)
 
 # 6) Обобщена таблица по активности
@@ -608,22 +729,43 @@ else:
     st.info("Няма достатъчно данни за изграждане на модел за наклона.")
 
 # ---------------------------------------------------------
+# ЗОНИ – СКОРОСТ + ПУЛС (ВСИЧКИ АКТИВНОСТИ)
+# ---------------------------------------------------------
+seg_zones = assign_speed_zones(seg_slope, V_CRIT)
+
+st.subheader("Разпределение по зони – скорост и пулс (всички активности)")
+zone_table_all = build_zone_speed_hr_table(seg_zones, V_CRIT, activity=None)
+st.dataframe(zone_table_all, use_container_width=True)
+
+# ---------------------------------------------------------
+# ЗОНИ – СКОРОСТ + ПУЛС (ИЗБРАНА АКТИВНОСТ)
+# ---------------------------------------------------------
+st.subheader("Разпределение по зони – скорост и пулс (избрана активност)")
+
+act_list = sorted(seg_zones["activity"].unique())
+act_selected = st.selectbox("Избери активност:", act_list)
+
+zone_table_act = build_zone_speed_hr_table(seg_zones, V_CRIT, activity=act_selected)
+st.dataframe(zone_table_act, use_container_width=True)
+
+# ---------------------------------------------------------
 # ЕКСПОРТ НА СЕГМЕНТИТЕ
 # ---------------------------------------------------------
 st.subheader("Експорт на сегментите (след двете модулации)")
 
 export_cols = [
     "activity", "seg_idx", "t_start", "t_end", "dt_s", "d_m",
-    "slope_pct", "v_kmh", "valid_basic", "K_glide", "v_glide", "v_flat_eq"
+    "slope_pct", "v_kmh", "valid_basic", "K_glide", "v_glide",
+    "v_flat_eq", "hr_mean", "rel_crit", "zone"
 ]
-available_export_cols = [c for c in export_cols if c in seg_slope.columns]
-export_df = seg_slope[available_export_cols].copy()
+available_export_cols = [c for c in export_cols if c in seg_zones.columns]
+export_df = seg_zones[available_export_cols].copy()
 
 csv_data = export_df.to_csv(index=False).encode("utf-8")
 
 st.download_button(
     label="Свали сегментите като CSV",
     data=csv_data,
-    file_name="segments_glide_slope.csv",
+    file_name="segments_glide_slope_zones.csv",
     mime="text/csv"
 )
