@@ -8,7 +8,7 @@ import math
 import altair as alt
 
 # ---------------------------------------------------------
-# НАСТРОЙКИ (фиксирани – ако искаш, лесно се правят в UI)
+# НАСТРОЙКИ (фиксирани прагове, но V_crit и DAMP_GLIDE са в UI)
 # ---------------------------------------------------------
 T_SEG = 7.0            # дължина на сегмента [s]
 MIN_D_SEG = 5.0        # минимум хоризонтална дистанция [m]
@@ -19,9 +19,6 @@ V_JUMP_MIN = 20.0      # гледаме спайкове само над таз�
 
 GLIDE_POLY_DEG = 2     # степен на полинома за плъзгаемост
 SLOPE_POLY_DEG = 2     # степен на полинома за наклон
-DAMP_GLIDE = 1.0       # омекотяване на коефициента на плъзгаемост (0–1)
-
-V_CRIT = 20.0          # критична скорост [km/h] за зони и силни спускания
 
 # Зонна система като % от критичната скорост
 ZONE_BOUNDS = [0.0, 0.75, 0.85, 0.95, 1.05, 1.15, np.inf]
@@ -68,6 +65,17 @@ def poly_to_str(poly, var="s"):
             f"{fmt_coef(c)}·{var}^{p}"
             for p, c in zip(range(deg, -1, -1), coeffs)
         )
+
+
+def seconds_to_hhmmss(seconds: float) -> str:
+    """Превръща секунди във формат ч:мм:сс."""
+    if pd.isna(seconds):
+        return ""
+    s = int(round(seconds))
+    h = s // 3600
+    m = (s % 3600) // 60
+    sec = s % 60
+    return f"{h}:{m:02d}:{sec:02d}"
 
 
 # ---------------------------------------------------------
@@ -285,7 +293,7 @@ def fit_glide_poly(train_df):
     return np.poly1d(coeffs)
 
 
-def compute_glide_coefficients(seg, glide_poly):
+def compute_glide_coefficients(seg, glide_poly, DAMP_GLIDE):
     """
     Връща dict activity -> K_glide.
     1) k_raw = V_model / V_real
@@ -551,7 +559,7 @@ def compute_zone_hr_from_counts(seg_df, zone_counts):
 def build_zone_speed_hr_table(seg_zones, V_crit, activity=None):
     """
     Връща таблица по зони:
-      zone | n_segments | total_time_s | mean_v_flat_eq | mean_hr_zone
+      Зона | Брой сегменти | Време [ч:мм:сс] | Средна скорост | Среден пулс
     Ако activity е None -> всички активности.
     """
     if activity is not None:
@@ -561,14 +569,14 @@ def build_zone_speed_hr_table(seg_zones, V_crit, activity=None):
 
     if df.empty:
         return pd.DataFrame(columns=[
-            "Зона", "Брой сегменти", "Време [s]",
+            "Зона", "Брой сегменти", "Време [ч:мм:сс]",
             "Средна скорост [km/h]", "Среден пулс [bpm]"
         ])
 
     speed_summary = summarize_speed_zones(df)
     if speed_summary.empty:
         return pd.DataFrame(columns=[
-            "Зона", "Брой сегменти", "Време [s]",
+            "Зона", "Брой сегменти", "Време [ч:мм:сс]",
             "Средна скорост [km/h]", "Среден пулс [bpm]"
         ])
 
@@ -577,24 +585,52 @@ def build_zone_speed_hr_table(seg_zones, V_crit, activity=None):
 
     merged = pd.merge(speed_summary, hr_summary, on="zone", how="left")
 
+    # добавяме форматирано време
+    merged["time_hhmmss"] = merged["total_time_s"].apply(seconds_to_hhmmss)
+
     merged = merged.rename(columns={
         "zone": "Зона",
         "n_segments": "Брой сегменти",
-        "total_time_s": "Време [s]",
+        "time_hhmmss": "Време [ч:мм:сс]",
         "mean_v_flat_eq": "Средна скорост [km/h]",
         "mean_hr_zone": "Среден пулс [bpm]",
     })
+
+    # подреждаме колоните
+    merged = merged[[
+        "Зона", "Брой сегменти", "Време [ч:мм:сс]",
+        "Средна скорост [km/h]", "Среден пулс [bpm]"
+    ]]
 
     return merged
 
 
 # ---------------------------------------------------------
-# STREAMLIT APP – ИЗЧИСТЕН UI + ЗОНИ
+# STREAMLIT APP – ИЗЧИСТЕН UI + КОНТРОЛЕН ПАНЕЛ
 # ---------------------------------------------------------
 st.set_page_config(page_title="Ski Glide & Slope Model", layout="wide")
 st.title("Модел за плъзгаемост и наклон при ски бягане")
 
-st.caption(f"Параметри на модела: V_crit = {V_CRIT:.1f} km/h, α (DAMP_GLIDE) = {DAMP_GLIDE:.2f}")
+# Контролен панел за омекотяване и критична скорост
+st.sidebar.header("Параметри на модела")
+
+V_crit = st.sidebar.number_input(
+    "Критична скорост V_crit [km/h]",
+    min_value=5.0,
+    max_value=40.0,
+    value=20.0,
+    step=0.5
+)
+
+DAMP_GLIDE = st.sidebar.slider(
+    "Омекотяване на плъзгаемостта α (0 = без ефект, 1 = пълен ефект)",
+    min_value=0.0,
+    max_value=1.0,
+    value=1.0,
+    step=0.05
+)
+
+st.caption(f"Текущи параметри: V_crit = {V_crit:.1f} km/h, α (DAMP_GLIDE) = {DAMP_GLIDE:.2f}")
 
 uploaded_files = st.file_uploader(
     "Качи един или няколко TCX файла:",
@@ -644,7 +680,7 @@ if glide_poly is None:
     glide_coeffs = {}
     seg_glide = apply_glide_modulation(segments_f, glide_coeffs)
 else:
-    glide_coeffs = compute_glide_coefficients(segments_f, glide_poly)
+    glide_coeffs = compute_glide_coefficients(segments_f, glide_poly, DAMP_GLIDE)
     seg_glide = apply_glide_modulation(segments_f, glide_coeffs)
 
 # 5) Модел за наклон (F(0)=1)
@@ -654,14 +690,14 @@ raw_slope_poly = fit_slope_poly(slope_train)
 
 if raw_slope_poly is None:
     slope_poly = None
-    seg_slope = apply_slope_modulation(seg_glide, slope_poly, V_CRIT)
+    seg_slope = apply_slope_modulation(seg_glide, slope_poly, V_crit)
 else:
     F0 = float(raw_slope_poly(0.0))
     offset = F0 - 1.0
     coeffs = raw_slope_poly.coefficients.copy()
     coeffs[-1] -= offset  # корекция на свободния член => F(0)=1
     slope_poly = np.poly1d(coeffs)
-    seg_slope = apply_slope_modulation(seg_glide, slope_poly, V_CRIT)
+    seg_slope = apply_slope_modulation(seg_glide, slope_poly, V_crit)
 
 # 6) Обобщена таблица по активности
 summary_df = build_activity_summary(
@@ -731,10 +767,10 @@ else:
 # ---------------------------------------------------------
 # ЗОНИ – СКОРОСТ + ПУЛС (ВСИЧКИ АКТИВНОСТИ)
 # ---------------------------------------------------------
-seg_zones = assign_speed_zones(seg_slope, V_CRIT)
+seg_zones = assign_speed_zones(seg_slope, V_crit)
 
 st.subheader("Разпределение по зони – скорост и пулс (всички активности)")
-zone_table_all = build_zone_speed_hr_table(seg_zones, V_CRIT, activity=None)
+zone_table_all = build_zone_speed_hr_table(seg_zones, V_crit, activity=None)
 st.dataframe(zone_table_all, use_container_width=True)
 
 # ---------------------------------------------------------
@@ -745,7 +781,7 @@ st.subheader("Разпределение по зони – скорост и п�
 act_list = sorted(seg_zones["activity"].unique())
 act_selected = st.selectbox("Избери активност:", act_list)
 
-zone_table_act = build_zone_speed_hr_table(seg_zones, V_CRIT, activity=act_selected)
+zone_table_act = build_zone_speed_hr_table(seg_zones, V_crit, activity=act_selected)
 st.dataframe(zone_table_act, use_container_width=True)
 
 # ---------------------------------------------------------
@@ -769,3 +805,4 @@ st.download_button(
     file_name="segments_glide_slope_zones.csv",
     mime="text/csv"
 )
+
