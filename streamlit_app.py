@@ -418,7 +418,7 @@ def apply_slope_modulation(seg_glide, slope_poly, V_crit):
 # ---------------------------------------------------------
 # ОБОБЩЕНИЕ ЗА UI ТАБЛИЦАТА ПО АКТИВНОСТИ
 # ---------------------------------------------------------
-def build_activity_summary(segments_f, train_glide, seg_glide, seg_slope, glide_coeffs):
+def build_activity_summary(segments_f, train_glide, seg_glide, seg_slope, seg_slope_cs, glide_coeffs):
     activities = sorted(segments_f["activity"].unique())
     summary = pd.DataFrame({"activity": activities})
 
@@ -461,9 +461,16 @@ def build_activity_summary(segments_f, train_glide, seg_glide, seg_slope, glide_
     ).reset_index()
     summary = summary.merge(slope_agg, on="activity", how="left")
 
-    # 6) Ефективен коефициент от наклона
+    # 6) Средна скорост след CS модулация (v_flat_eq_cs)
+    cs_agg = seg_slope_cs[seg_slope_cs["valid_basic"]].groupby("activity").agg(
+        v_flat_cs_mean=("v_flat_eq_cs", "mean")
+    ).reset_index()
+    summary = summary.merge(cs_agg, on="activity", how="left")
+
+    # 7) Ефективен коефициент от наклона
     summary["K_slope_eff"] = summary["v_flat_mean"] / summary["v_glide_mean"]
 
+    # Подреждане на колоните
     summary = summary[
         [
             "activity",
@@ -473,10 +480,12 @@ def build_activity_summary(segments_f, train_glide, seg_glide, seg_slope, glide_
             "v_real_mean",
             "v_glide_mean",
             "v_flat_mean",
+            "v_flat_cs_mean",
             "K_slope_eff",
         ]
     ]
 
+    # Преименуване за UI
     summary = summary.rename(columns={
         "activity": "Активност",
         "slope_glide_mean": "Среден наклон на спусканията за модел [%]",
@@ -484,7 +493,8 @@ def build_activity_summary(segments_f, train_glide, seg_glide, seg_slope, glide_
         "K_glide": "Коефициент плъзгаемост K_glide",
         "v_real_mean": "Средна реална скорост [km/h]",
         "v_glide_mean": "Средна скорост след плъзгаемост [km/h]",
-        "v_flat_mean": "Средна скорост еквивалентна на равно [km/h]",
+        "v_flat_mean": "Средна скорост еквив. на равно [km/h]",
+        "v_flat_cs_mean": "Средна скорост след CS модулация [km/h]",
         "K_slope_eff": "Ефективен коефициент наклон K_slope",
     })
 
