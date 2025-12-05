@@ -676,7 +676,6 @@ def build_zone_speed_hr_table(seg_zones, V_crit, activity=None):
 # ---------------------------------------------------------
 st.set_page_config(page_title="Ski Glide & Slope Model", layout="wide")
 st.title("Модел за плъзгаемост, наклон и кислороден дълг при ски бягане")
-
 # ---------- Sidebar: основни параметри ----------
 st.sidebar.header("Параметри на наклона и плъзгаемостта")
 
@@ -685,22 +684,39 @@ V_crit = st.sidebar.number_input(
     min_value=5.0,
     max_value=40.0,
     value=20.0,
-    step=0.5
+    step=0.5,
+    help=(
+        "Референтна „критична“ скорост, спрямо която се определят "
+        "скоростните зони (Z1–Z6). Използва се и за ограничаване на "
+        "силните спускания (под −3% → 0.7·V_crit)."
+    ),
 )
 
 DAMP_GLIDE = st.sidebar.slider(
-    "Омекотяване на плъзгаемостта α (0 = без ефект, 1 = пълен ефект)",
+    "Омекотяване на плъзгаемостта α",
     min_value=0.0,
     max_value=1.0,
     value=1.0,
-    step=0.05
+    step=0.05,
+    help=(
+        "Коефициент за омекотяване на корекцията по плъзгаемост.\n"
+        "α = 1 → пълна корекция според модела (максимално влияние).\n"
+        "α = 0 → без корекция по плъзгаемост (K_glide = 1)."
+    ),
 )
 
 st.sidebar.markdown("---")
 
 # ---------- Sidebar: CS / кислороден дълг ----------
 st.sidebar.header("CS модел (кислороден „дълг“)")
-use_vcrit_as_cs = st.sidebar.checkbox("Използвай V_crit като CS", value=True)
+use_vcrit_as_cs = st.sidebar.checkbox(
+    "Използвай V_crit като CS",
+    value=True,
+    help=(
+        "Ако е включено, критичната скорост за CS модела се приема "
+        "равна на V_crit. Ако е изключено, можеш да зададеш отделна CS."
+    ),
+)
 
 if use_vcrit_as_cs:
     CS = V_crit
@@ -710,87 +726,101 @@ else:
         min_value=5.0,
         max_value=40.0,
         value=18.0,
-        step=0.5
+        step=0.5,
+        help=(
+            "Критична скорост в CS модела. При скорости над CS се натрупва "
+            "„кислороден дълг“ (Δv⁺ = max(v − CS, 0))."
+        ),
     )
 
 tau_min = st.sidebar.number_input(
-    "τ_min (s) – минимална константа",
+    "τ_min (s)",
     min_value=5.0,
     max_value=120.0,
     value=25.0,
-    step=1.0
+    step=1.0,
+    help=(
+        "Минимална времева константа τ_min в модела τ(Δv).\n"
+        "Колкото е по-малка τ_min, толкова по-бързо системата реагира "
+        "при малки отклонения около CS."
+    ),
 )
 
 k_par = st.sidebar.number_input(
-    "k – растеж на τ с отклонението",
+    "k (τ растеж)",
     min_value=0.0,
     max_value=500.0,
     value=35.0,
-    step=1.0
+    step=1.0,
+    help=(
+        "Параметър k в τ(Δv) = τ_min + k·(Δv)^q.\n"
+        "Определя колко силно нараства времевата константа τ при по-големи "
+        "отклонения над CS (по-тежки интервали → по-дълъг „дълг“)."
+    ),
 )
 
 q_par = st.sidebar.number_input(
-    "q – нелинейност на τ(Δv)",
+    "q (нелинейност)",
     min_value=0.1,
     max_value=3.0,
     value=1.3,
-    step=0.1
+    step=0.1,
+    help=(
+        "Степенният показател q в τ(Δv) = τ_min + k·(Δv)^q.\n"
+        "q = 1 → линейна зависимост; q > 1 → по-силно нарастване на τ "
+        "при по-високи скорости над CS."
+    ),
 )
 
 gamma_cs = st.sidebar.slider(
-    "γ – каква част от ликвидацията „повдига“ скоростта",
+    "γ (влияние на дълга)",
     min_value=0.0,
     max_value=1.0,
     value=1.0,
-    step=0.05
+    step=0.05,
+    help=(
+        "Определя каква част от „ликвидацията“ r(t) се добавя към скоростта.\n"
+        "v_CS = v_flat_eq + γ·r.\n"
+        "γ = 0 → CS моделът няма ефект; γ = 1 → пълен ефект."
+    ),
 )
 
 st.sidebar.subheader("Калибрация по референтен сценарий")
+
 ref_percent = st.sidebar.number_input(
     "Референтна интензивност (% от CS)",
     min_value=101.0,
     max_value=200.0,
     value=105.0,
-    step=0.5
+    step=0.5,
+    help=(
+        "Сценарий за калибрация: постоянна скорост = този процент от CS.\n"
+        "Използва се за определяне на t₉₀ (време до достигане на 90% от "
+        "максималния кислороден дълг)."
+    ),
 )
+
 target_t90 = st.sidebar.number_input(
     "Желано t₉₀ (s)",
     min_value=10.0,
     max_value=1200.0,
     value=60.0,
-    step=5.0
-)
-do_calibrate = st.sidebar.button("Приложи калибрация (пресметни k)")
-
-st.caption(
-    f"Текущи параметри: V_crit = {V_crit:.1f} km/h, CS = {CS:.1f} km/h, "
-    f"α (DAMP_GLIDE) = {DAMP_GLIDE:.2f}"
-)
-
-uploaded_files = st.file_uploader(
-    "Качи един или няколко TCX файла:",
-    type=["tcx"],
-    accept_multiple_files=True
+    step=5.0,
+    help=(
+        "Желано време t₉₀ при референтната интензивност.\n"
+        "При натискане на „Приложи калибрация“ параметърът k се преизчислява "
+        "така, че моделът да дава това t₉₀."
+    ),
 )
 
-if not uploaded_files:
-    st.info("Качи поне един TCX файл, за да започнем.")
-    st.stop()
+do_calibrate = st.sidebar.button(
+    "Приложи калибрация (пресметни k)",
+    help=(
+        "Преизчислява k така, че при зададените CS, τ_min, q и референтен "
+        "процент от CS, моделът да дава посоченото t₉₀."
+    ),
+)
 
-# 1) Парсване на файловете
-all_points = []
-for f in uploaded_files:
-    label = f.name
-    df_act = parse_tcx(f, label)
-    if df_act.empty:
-        continue
-    all_points.append(df_act)
-
-if not all_points:
-    st.error("Не успях да извлека данни от файловете.")
-    st.stop()
-
-points = pd.concat(all_points, ignore_index=True)
 
 # 2) Сегментиране
 seg_list = []
