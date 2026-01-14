@@ -14,14 +14,10 @@ from cs_modulator import (
 )
 
 # ---------------------------------------------------------
-# НАСТРОЙКИ (фиксирани прагове, но V_crit и DAMP_GLIDE са в UI)
+# ФИКСИРАНИ ПРАГОВЕ (само минимални технически, НЕ "изрязвания" по slope/спайкове)
 # ---------------------------------------------------------
-T_SEG = 7.0            # дължина на сегмента [s]
 MIN_D_SEG = 5.0        # минимум хоризонтална дистанция [m]
 MIN_T_SEG = 4.0        # минимум продължителност [s]
-MAX_ABS_SLOPE = 15.0   # макс. наклон [%]
-V_JUMP_KMH = 15.0      # праг за "скачане" на скоростта между сегменти
-V_JUMP_MIN = 20.0      # гледаме спайкове само над тази скорост [km/h]
 
 GLIDE_POLY_DEG = 2     # степен на полинома за плъзгаемост
 SLOPE_POLY_DEG = 2     # степен на полинома за наклон
@@ -29,7 +25,6 @@ SLOPE_POLY_DEG = 2     # степен на полинома за наклон
 # Зонна система като % от критичната скорост
 ZONE_BOUNDS = [0.0, 0.75, 0.85, 0.95, 1.05, 1.15, np.inf]
 ZONE_NAMES = ["Z1", "Z2", "Z3", "Z4", "Z5", "Z6"]
-
 
 # ---------------------------------------------------------
 # ВСПОМОГАТЕЛНИ ФУНКЦИИ
@@ -47,7 +42,7 @@ def haversine(lat1, lon1, lat2, lon2):
 
 
 def poly_to_str(poly, var="s"):
-    """Форматира np.poly1d като четим стринг (до квадратична степен)."""
+    """Форматира np.poly1d като четим стринг."""
     if poly is None:
         return "няма модел (недостатъчно данни)"
 
@@ -82,43 +77,17 @@ def seconds_to_hhmmss(seconds: float) -> str:
     m = (s % 3600) // 60
     sec = s % 60
     return f"{h}:{m:02d}:{sec:02d}"
+
+
 def clean_speed_for_cs(g, v_max_cs=50.0):
     """
     Чисти скоростта преди CS-модулацията:
       - клипва v_flat_eq в [0, v_max_cs]
-      - за сегментите със speed_spike=True прави линейна интерполация
-        между най-близките 'чисти' сегменти.
-    g е под-DataFrame за дадена активност.
+      - НЕ реже сегменти. Само клипва.
     """
     v = g["v_flat_eq"].to_numpy(dtype=float)
-
-    # 1) глобален клип – отрязваме абсурдни стойности
     v = np.clip(v, 0.0, v_max_cs)
-
-    # 2) интерполация върху спайковете
-    if "speed_spike" in g.columns:
-        is_spike = g["speed_spike"].to_numpy(dtype=bool)
-    else:
-        is_spike = np.zeros_like(v, dtype=bool)
-
-    if not is_spike.any():
-        return v  # няма спайкове
-
-    v_clean = v.copy()
-    idx = np.arange(len(v_clean))
-
-    good = ~is_spike
-    if good.sum() == 0:
-        # в крайен случай – ако всичко е спайк, връщаме оригинала
-        return v_clean
-    if good.sum() == 1:
-        # само една добра точка – всички спайкове стават равни на нея
-        v_clean[is_spike] = v_clean[good][0]
-        return v_clean
-
-    # линейна интерполация по индекса
-    v_clean[is_spike] = np.interp(idx[is_spike], idx[good], v_clean[good])
-    return v_clean
+    return v
 
 
 # ---------------------------------------------------------
@@ -140,7 +109,7 @@ def parse_tcx(file, activity_label):
             time = datetime.fromisoformat(t_el.text.replace("Z", "+00:00"))
 
             pos_el = tp.find("tcx:Position", ns)
-            lat = lon = None
+            lat = lon = np.nan
             if pos_el is not None:
                 lat_el = pos_el.find("tcx:LatitudeDegrees", ns)
                 lon_el = pos_el.find("tcx:LongitudeDegrees", ns)
@@ -149,10 +118,10 @@ def parse_tcx(file, activity_label):
                     lon = float(lon_el.text)
 
             alt_el = tp.find("tcx:AltitudeMeters", ns)
-            elev = float(alt_el.text) if alt_el is not None else None
+            elev = float(alt_el.text) if alt_el is not None else np.nan
 
             dist_el = tp.find("tcx:DistanceMeters", ns)
-            dist = float(dist_el.text) if dist_el is not None else None
+            dist = float(dist_el.text) if dist_el is not None else np.nan
 
             hr_el = tp.find(".//tcx:HeartRateBpm/tcx:Value", ns)
             hr = float(hr_el.text) if hr_el is not None else np.nan
@@ -162,8 +131,8 @@ def parse_tcx(file, activity_label):
                 "time": time,
                 "lat": lat,
                 "lon": lon,
-                "elev": elev,
-                "dist": dist,
+                "elev": elev,     # сурова височина
+                "dist": dist,     # може да е NaN
                 "hr": hr,
             })
 
@@ -174,12 +143,12 @@ def parse_tcx(file, activity_label):
     df.sort_values("time", inplace=True)
     df.reset_index(drop=True, inplace=True)
 
-    # ако няма дистанция – смятаме грубо от lat/lon
+    # Ако няма дистанция – смятаме от lat/lon
     if df["dist"].isna().all():
         df["dist"] = 0.0
         for i in range(1, len(df)):
-            if None in (df.at[i-1, "lat"], df.at[i-1, "lon"],
-                        df.at[i, "lat"], df.at[i, "lon"]):
+            if not (np.isfinite(df.at[i-1, "lat"]) and np.isfinite(df.at[i-1, "lon"])
+                    and np.isfinite(df.at[i, "lat"]) and np.isfinite(df.at[i, "lon"])):
                 df.at[i, "dist"] = df.at[i-1, "dist"]
                 continue
             d = haversine(
@@ -193,21 +162,44 @@ def parse_tcx(file, activity_label):
 
 
 # ---------------------------------------------------------
-# СЕГМЕНТИРАНЕ НА 7 s (с hr_mean)
+# ПЛАВАЩА СРЕДНА НА ВИСОЧИНАТА (time-based rolling)
 # ---------------------------------------------------------
-def build_segments(df_activity, activity_label):
+def add_elev_smooth(points_df, alt_window_s: int):
+    """
+    Добавя колона elev_smooth (по активности), time-based rolling mean.
+    """
+    df = points_df.copy()
+    df["time"] = pd.to_datetime(df["time"])
+    df = df.sort_values(["activity", "time"]).reset_index(drop=True)
+
+    out_parts = []
+    for act, g in df.groupby("activity", group_keys=False):
+        gg = g.copy().set_index("time")
+        w = f"{int(alt_window_s)}s"
+        gg["elev_smooth"] = gg["elev"].rolling(window=w, center=True, min_periods=1).mean()
+        gg = gg.reset_index()
+        out_parts.append(gg)
+
+    return pd.concat(out_parts, ignore_index=True)
+
+
+# ---------------------------------------------------------
+# СЕГМЕНТИРАНЕ (T_SEG от UI) + slope от SMOOTH, плюс slope_raw за сравнение
+# ---------------------------------------------------------
+def build_segments(df_activity, activity_label, T_SEG: float):
     if df_activity.empty:
         return pd.DataFrame(columns=[
             "activity", "seg_idx", "t_start", "t_end", "dt_s", "d_m",
-            "slope_pct", "v_kmh", "hr_mean"
+            "slope_pct", "slope_raw_pct", "v_kmh", "hr_mean"
         ])
 
     df_activity = df_activity.sort_values("time").reset_index(drop=True)
 
     times = df_activity["time"].to_numpy()
-    elevs = df_activity["elev"].to_numpy()
-    dists = df_activity["dist"].to_numpy()
-    hrs = df_activity["hr"].to_numpy()
+    elev_raw = df_activity["elev"].to_numpy(dtype=float)
+    elev_smooth = df_activity["elev_smooth"].to_numpy(dtype=float)
+    dists = df_activity["dist"].to_numpy(dtype=float)
+    hrs = df_activity["hr"].to_numpy(dtype=float)
 
     n = len(df_activity)
     start_idx = 0
@@ -232,18 +224,21 @@ def build_segments(df_activity, activity_label):
 
         d0 = dists[start_idx]
         d1 = dists[end_idx]
-        elev0 = elevs[start_idx]
-        elev1 = elevs[end_idx]
         d_m = max(0.0, d1 - d0)
 
         if dt < MIN_T_SEG or d_m < MIN_D_SEG:
             start_idx = end_idx
             continue
 
-        if elev0 is None or elev1 is None or np.isnan(elev0) or np.isnan(elev1):
-            slope = np.nan
-        else:
-            slope = (elev1 - elev0) / d_m * 100.0 if d_m > 0 else np.nan
+        # slope от smooth elev (основният slope)
+        e0s = elev_smooth[start_idx]
+        e1s = elev_smooth[end_idx]
+        slope_smooth = (e1s - e0s) / d_m * 100.0 if (np.isfinite(e0s) and np.isfinite(e1s) and d_m > 0) else np.nan
+
+        # slope от raw elev (само за сравнение/експорт)
+        e0r = elev_raw[start_idx]
+        e1r = elev_raw[end_idx]
+        slope_raw = (e1r - e0r) / d_m * 100.0 if (np.isfinite(e0r) and np.isfinite(e1r) and d_m > 0) else np.nan
 
         v_kmh = (d_m / dt) * 3.6
         hr_mean = float(np.nanmean(hrs[start_idx:end_idx + 1]))
@@ -255,7 +250,8 @@ def build_segments(df_activity, activity_label):
             "t_end": pd.to_datetime(t1),
             "dt_s": float(dt),
             "d_m": float(d_m),
-            "slope_pct": float(slope) if not np.isnan(slope) else np.nan,
+            "slope_pct": float(slope_smooth) if np.isfinite(slope_smooth) else np.nan,
+            "slope_raw_pct": float(slope_raw) if np.isfinite(slope_raw) else np.nan,
             "v_kmh": float(v_kmh),
             "hr_mean": hr_mean
         })
@@ -266,37 +262,15 @@ def build_segments(df_activity, activity_label):
     if not seg_rows:
         return pd.DataFrame(columns=[
             "activity", "seg_idx", "t_start", "t_end", "dt_s", "d_m",
-            "slope_pct", "v_kmh", "hr_mean"
+            "slope_pct", "slope_raw_pct", "v_kmh", "hr_mean"
         ])
 
-    return pd.DataFrame(seg_rows)
+    seg = pd.DataFrame(seg_rows)
 
-
-# ---------------------------------------------------------
-# ФИЛТРИ ЗА НЕРЕАЛИСТИЧНИ СЕГМЕНТИ
-# ---------------------------------------------------------
-def apply_basic_filters(segments):
-    seg = segments.copy()
-
-    valid_slope = seg["slope_pct"].between(-MAX_ABS_SLOPE, MAX_ABS_SLOPE)
-    valid_slope &= seg["slope_pct"].notna()
-    seg["valid_basic"] = valid_slope
-
-    def mark_speed_spikes(group):
-        group = group.sort_values("seg_idx").copy()
-        spike = np.zeros(len(group), dtype=bool)
-        v = group["v_kmh"].values
-        for i in range(1, len(group)):
-            dv = abs(v[i] - v[i-1])
-            vmax = max(v[i], v[i-1])
-            if dv > V_JUMP_KMH and vmax > V_JUMP_MIN:
-                spike[i] = True
-        group["speed_spike"] = spike
-        return group
-
-    seg = seg.groupby("activity", group_keys=False).apply(mark_speed_spikes)
-    seg["speed_spike"] = seg["speed_spike"].fillna(False)
-    seg.loc[seg["speed_spike"], "valid_basic"] = False
+    # Тук НЕ режем по наклон, НЕ махаме спайкове.
+    # Единствено: slope трябва да е наличен, иначе моделите не могат да се обучават.
+    seg["valid_basic"] = seg["slope_pct"].notna()
+    seg["speed_spike"] = False  # запазваме колоната за съвместимост с твоите таблици
 
     return seg
 
@@ -341,8 +315,7 @@ def compute_glide_coefficients(seg, glide_poly, DAMP_GLIDE):
     Връща dict activity -> K_glide.
     1) k_raw = V_model / V_real
     2) клипваме k_raw в [0.90, 1.25]
-    3) омекотяваме към 1 с коефициент DAMP_GLIDE:
-       K = 1 + α * (k_clipped - 1)
+    3) омекотяваме към 1 с коефициент DAMP_GLIDE
     """
     train = get_glide_training_segments(seg)
     if glide_poly is None or train.empty:
@@ -393,13 +366,13 @@ def compute_flat_ref_speeds(seg_glide):
 def get_slope_training_data(seg_glide, flat_refs):
     """
     Обучаващите данни за F(slope):
-    - използваме сегменти с наклон в [-15, +15]%
+    - използваме всички валидни сегменти
+    (няма изрязване по MAX_ABS_SLOPE)
     """
     df = seg_glide.copy()
     df["V_flat_ref"] = df["activity"].map(flat_refs)
     mask = (
         df["valid_basic"] &
-        df["slope_pct"].between(-15.0, 15.0) &
         df["V_flat_ref"].notna() &
         (df["v_glide"] > 0)
     )
@@ -429,21 +402,22 @@ def apply_slope_modulation(seg_glide, slope_poly, V_crit):
 
     slopes = df["slope_pct"].values.astype(float)
     F_vals = slope_poly(slopes)
+
+    # Запазваме твоята логика за ограничения на F (не е "изрязване", а стабилизация на модела)
     F_vals = np.clip(F_vals, 0.7, 1.7)
 
-    # |slope| <= 1% -> F = 1
     mask_mid = np.abs(slopes) <= 1.0
     F_vals[mask_mid] = 1.0
-    # спускане <-1% -> F<=1
+
     mask_down = slopes < -1.0
     F_vals[mask_down] = np.minimum(F_vals[mask_down], 1.0)
-    # изкачване >1% -> F>=1
+
     mask_up = slopes > 1.0
     F_vals[mask_up] = np.maximum(F_vals[mask_up], 1.0)
 
     v_flat_eq = df["v_glide"].values * F_vals
 
-    # силни спускания под -3% -> 70% от V_crit
+    # силни спускания под -3% -> 70% от V_crit (твоята защита)
     if V_crit is not None and V_crit > 0:
         idx_below = df["slope_pct"] < -3.0
         v_flat_eq[idx_below] = 0.7 * V_crit
@@ -466,7 +440,6 @@ def build_activity_summary(
     activities = sorted(segments_f["activity"].unique())
     summary = pd.DataFrame({"activity": activities})
 
-    # 1) Среден наклон и скорост на обучаващите сегменти за плъзгаемост
     if not train_glide.empty:
         glide_train_agg = train_glide.groupby("activity").agg(
             slope_glide_mean=("slope_pct", "mean"),
@@ -477,7 +450,6 @@ def build_activity_summary(
         summary["slope_glide_mean"] = np.nan
         summary["v_glide_train_mean"] = np.nan
 
-    # 2) Коефициент K_glide по активност
     if glide_coeffs:
         K_glide_df = pd.DataFrame(
             {"activity": list(glide_coeffs.keys()),
@@ -487,34 +459,28 @@ def build_activity_summary(
     else:
         summary["K_glide"] = np.nan
 
-    # 3) Реална средна скорост (преди модулации)
     real_agg = segments_f[segments_f["valid_basic"]].groupby("activity").agg(
         v_real_mean=("v_kmh", "mean")
     ).reset_index()
     summary = summary.merge(real_agg, on="activity", how="left")
 
-    # 4) Средна скорост след плъзгаемост
     glide_agg = seg_glide[seg_glide["valid_basic"]].groupby("activity").agg(
         v_glide_mean=("v_glide", "mean")
     ).reset_index()
     summary = summary.merge(glide_agg, on="activity", how="left")
 
-    # 5) Средна скорост след наклон (еквивалентна на равно)
     slope_agg = seg_slope[seg_slope["valid_basic"]].groupby("activity").agg(
         v_flat_mean=("v_flat_eq", "mean")
     ).reset_index()
     summary = summary.merge(slope_agg, on="activity", how="left")
 
-    # 6) Средна скорост след CS модулация
     cs_agg = seg_slope_cs[seg_slope_cs["valid_basic"]].groupby("activity").agg(
         v_flat_cs_mean=("v_flat_eq_cs", "mean")
     ).reset_index()
     summary = summary.merge(cs_agg, on="activity", how="left")
 
-    # 7) Ефективен коефициент наклон
     summary["K_slope_eff"] = summary["v_flat_mean"] / summary["v_glide_mean"]
 
-    # Подреждаме колоните
     summary = summary[
         [
             "activity",
@@ -529,7 +495,6 @@ def build_activity_summary(
         ]
     ]
 
-    # Преименуване за UI
     summary = summary.rename(columns={
         "activity": "Активност",
         "slope_glide_mean": "Среден наклон на спусканията за модел [%]",
@@ -543,6 +508,7 @@ def build_activity_summary(
     })
 
     return summary
+
 
 # ---------------------------------------------------------
 # ЗОНИ ПО СКОРОСТ И ПУЛС (по твоята методика)
@@ -586,20 +552,10 @@ def summarize_speed_zones(seg_zones):
 
 def compute_zone_hr_from_counts(seg_df, zone_counts):
     """
-    seg_df: DataFrame със сегментите (вкл. и тези с |slope| > 15%)
-    zone_counts: dict {zone: n_segments}, на база скоростните зони.
-
-    Алгоритъм:
-      - филтрираме само:
-          * сегменти без speed_spike
-          * сегменти с наличен hr_mean
-      - сортираме тези сегменти по hr_mean ↑
-      - за Z1 взимаме първите N1, за Z2 – следващите N2, ...
+    Подреждаме сегментите по hr_mean и разпределяме по брой сегменти в зоните.
+    (без да режем по speed_spike – ние вече не ползваме spike филтър)
     """
     df_hr = seg_df.copy()
-    if "speed_spike" in df_hr.columns:
-        df_hr = df_hr[~df_hr["speed_spike"].fillna(False)]
-
     df_hr = df_hr.dropna(subset=["hr_mean"]).copy()
 
     if df_hr.empty:
@@ -625,11 +581,6 @@ def compute_zone_hr_from_counts(seg_df, zone_counts):
 
 
 def build_zone_speed_hr_table(seg_zones, V_crit, activity=None):
-    """
-    Връща таблица по зони:
-      Зона | Брой сегменти | Време [ч:мм:сс] | Средна скорост | Среден пулс
-    Ако activity е None -> всички активности.
-    """
     if activity is not None:
         df = seg_zones[seg_zones["activity"] == activity].copy()
     else:
@@ -652,7 +603,6 @@ def build_zone_speed_hr_table(seg_zones, V_crit, activity=None):
     hr_summary = compute_zone_hr_from_counts(df, zone_counts)
 
     merged = pd.merge(speed_summary, hr_summary, on="zone", how="left")
-
     merged["time_hhmmss"] = merged["total_time_s"].apply(seconds_to_hhmmss)
 
     merged = merged.rename(columns={
@@ -672,10 +622,36 @@ def build_zone_speed_hr_table(seg_zones, V_crit, activity=None):
 
 
 # ---------------------------------------------------------
-# STREAMLIT APP – ИЗЧИСТЕН UI + КОНТРОЛЕН ПАНЕЛ + CS МОДЕЛ
+# STREAMLIT APP
 # ---------------------------------------------------------
 st.set_page_config(page_title="Ski Glide & Slope Model", layout="wide")
 st.title("Модел за плъзгаемост, наклон и кислороден дълг при ски бягане")
+
+# ---------- Sidebar: сегментация и smoothing ----------
+st.sidebar.header("Сегментация и надморска височина")
+
+T_SEG = st.sidebar.slider(
+    "Дължина на сегмента T_SEG [s]",
+    min_value=3,
+    max_value=30,
+    value=7,
+    step=1,
+    help="Сегментиране по време. Колкото е по-малък сегментът, толкова повече шум има в slope."
+)
+
+ALT_WINDOW_S = st.sidebar.slider(
+    "Плаваща средна на височината [s]",
+    min_value=3,
+    max_value=61,
+    value=7,
+    step=2,
+    help="Time-based rolling mean върху elev. Използваме тази изгладена височина за slope."
+)
+
+show_debug_alt = st.sidebar.checkbox("Покажи графика elev raw vs smooth (точки)", value=False)
+
+st.sidebar.markdown("---")
+
 # ---------- Sidebar: основни параметри ----------
 st.sidebar.header("Параметри на наклона и плъзгаемостта")
 
@@ -684,12 +660,7 @@ V_crit = st.sidebar.number_input(
     min_value=5.0,
     max_value=40.0,
     value=20.0,
-    step=0.5,
-    help=(
-        "Референтна „критична“ скорост, спрямо която се определят "
-        "скоростните зони (Z1–Z6). Използва се и за ограничаване на "
-        "силните спускания (под −3% → 0.7·V_crit)."
-    ),
+    step=0.5
 )
 
 DAMP_GLIDE = st.sidebar.slider(
@@ -697,26 +668,15 @@ DAMP_GLIDE = st.sidebar.slider(
     min_value=0.0,
     max_value=1.0,
     value=1.0,
-    step=0.05,
-    help=(
-        "Коефициент за омекотяване на корекцията по плъзгаемост.\n"
-        "α = 1 → пълна корекция според модела (максимално влияние).\n"
-        "α = 0 → без корекция по плъзгаемост (K_glide = 1)."
-    ),
+    step=0.05
 )
 
 st.sidebar.markdown("---")
 
 # ---------- Sidebar: CS / кислороден дълг ----------
 st.sidebar.header("CS модел (кислороден „дълг“)")
-use_vcrit_as_cs = st.sidebar.checkbox(
-    "Използвай V_crit като CS",
-    value=True,
-    help=(
-        "Ако е включено, критичната скорост за CS модела се приема "
-        "равна на V_crit. Ако е изключено, можеш да зададеш отделна CS."
-    ),
-)
+
+use_vcrit_as_cs = st.sidebar.checkbox("Използвай V_crit като CS", value=True)
 
 if use_vcrit_as_cs:
     CS = V_crit
@@ -726,100 +686,19 @@ else:
         min_value=5.0,
         max_value=40.0,
         value=18.0,
-        step=0.5,
-        help=(
-            "Критична скорост в CS модела. При скорости над CS се натрупва "
-            "„кислороден дълг“ (Δv⁺ = max(v − CS, 0))."
-        ),
+        step=0.5
     )
 
-tau_min = st.sidebar.number_input(
-    "τ_min (s)",
-    min_value=5.0,
-    max_value=120.0,
-    value=25.0,
-    step=1.0,
-    help=(
-        "Минимална времева константа τ_min в модела τ(Δv).\n"
-        "Колкото е по-малка τ_min, толкова по-бързо системата реагира "
-        "при малки отклонения около CS."
-    ),
-)
-
-k_par = st.sidebar.number_input(
-    "k (τ растеж)",
-    min_value=0.0,
-    max_value=500.0,
-    value=35.0,
-    step=1.0,
-    help=(
-        "Параметър k в τ(Δv) = τ_min + k·(Δv)^q.\n"
-        "Определя колко силно нараства времевата константа τ при по-големи "
-        "отклонения над CS (по-тежки интервали → по-дълъг „дълг“)."
-    ),
-)
-
-q_par = st.sidebar.number_input(
-    "q (нелинейност)",
-    min_value=0.1,
-    max_value=3.0,
-    value=1.3,
-    step=0.1,
-    help=(
-        "Степенният показател q в τ(Δv) = τ_min + k·(Δv)^q.\n"
-        "q = 1 → линейна зависимост; q > 1 → по-силно нарастване на τ "
-        "при по-високи скорости над CS."
-    ),
-)
-
-gamma_cs = st.sidebar.slider(
-    "γ (влияние на дълга)",
-    min_value=0.0,
-    max_value=1.0,
-    value=1.0,
-    step=0.05,
-    help=(
-        "Определя каква част от „ликвидацията“ r(t) се добавя към скоростта.\n"
-        "v_CS = v_flat_eq + γ·r.\n"
-        "γ = 0 → CS моделът няма ефект; γ = 1 → пълен ефект."
-    ),
-)
+tau_min = st.sidebar.number_input("τ_min (s)", min_value=5.0, max_value=120.0, value=25.0, step=1.0)
+k_par = st.sidebar.number_input("k (τ растеж)", min_value=0.0, max_value=500.0, value=35.0, step=1.0)
+q_par = st.sidebar.number_input("q (нелинейност)", min_value=0.1, max_value=3.0, value=1.3, step=0.1)
+gamma_cs = st.sidebar.slider("γ (влияние на дълга)", min_value=0.0, max_value=1.0, value=1.0, step=0.05)
 
 st.sidebar.subheader("Калибрация по референтен сценарий")
+ref_percent = st.sidebar.number_input("Референтна интензивност (% от CS)", min_value=101.0, max_value=200.0, value=105.0, step=0.5)
+target_t90 = st.sidebar.number_input("Желано t₉₀ (s)", min_value=10.0, max_value=1200.0, value=60.0, step=5.0)
+do_calibrate = st.sidebar.button("Приложи калибрация (пресметни k)")
 
-ref_percent = st.sidebar.number_input(
-    "Референтна интензивност (% от CS)",
-    min_value=101.0,
-    max_value=200.0,
-    value=105.0,
-    step=0.5,
-    help=(
-        "Сценарий за калибрация: постоянна скорост = този процент от CS.\n"
-        "Използва се за определяне на t₉₀ (време до достигане на 90% от "
-        "максималния кислороден дълг)."
-    ),
-)
-
-target_t90 = st.sidebar.number_input(
-    "Желано t₉₀ (s)",
-    min_value=10.0,
-    max_value=1200.0,
-    value=60.0,
-    step=5.0,
-    help=(
-        "Желано време t₉₀ при референтната интензивност.\n"
-        "При натискане на „Приложи калибрация“ параметърът k се преизчислява "
-        "така, че моделът да дава това t₉₀."
-    ),
-)
-
-do_calibrate = st.sidebar.button(
-    "Приложи калибрация (пресметни k)",
-    help=(
-        "Преизчислява k така, че при зададените CS, τ_min, q и референтен "
-        "процент от CS, моделът да дава посоченото t₉₀."
-    ),
-)
 uploaded_files = st.file_uploader(
     "Качи един или няколко TCX файла:",
     type=["tcx"],
@@ -830,7 +709,7 @@ if not uploaded_files:
     st.info("Качи поне един TCX файл, за да започнем.")
     st.stop()
 
-# 1) Парсване на файловете
+# 1) Парсване
 all_points = []
 for f in uploaded_files:
     label = f.name
@@ -845,11 +724,29 @@ if not all_points:
 
 points = pd.concat(all_points, ignore_index=True)
 
+# 2) Добавяме elev_smooth
+points = add_elev_smooth(points, alt_window_s=int(ALT_WINDOW_S))
 
-# 2) Сегментиране
+# Debug графика за elev
+if show_debug_alt:
+    st.subheader("elev сурово vs elev изгладено (по точки)")
+    # само първата активност за да не е хаос
+    act0 = sorted(points["activity"].unique())[0]
+    p0 = points[points["activity"] == act0][["time", "elev", "elev_smooth"]].copy()
+    p0_long = p0.melt("time", var_name="series", value_name="m")
+    p0_long["series"] = p0_long["series"].map({"elev": "elev_raw", "elev_smooth": "elev_smooth"})
+    ch = alt.Chart(p0_long).mark_line().encode(
+        x="time:T",
+        y="m:Q",
+        color="series:N",
+        tooltip=["time:T", "series:N", alt.Tooltip("m:Q", format=".2f")]
+    ).interactive()
+    st.altair_chart(ch, use_container_width=True)
+
+# 3) Сегментиране (T_SEG от slider)
 seg_list = []
 for act, g in points.groupby("activity"):
-    seg_df = build_segments(g, act)
+    seg_df = build_segments(g, act, T_SEG=float(T_SEG))
     if not seg_df.empty:
         seg_list.append(seg_df)
 
@@ -858,8 +755,7 @@ if segments.empty:
     st.error("Не успях да създам сегменти. Провери TCX файловете.")
     st.stop()
 
-# 3) Базови филтри
-segments_f = apply_basic_filters(segments)
+segments_f = segments.copy()  # вече няма apply_basic_filters
 
 # 4) Модел за плъзгаемост
 train_glide = get_glide_training_segments(segments_f)
@@ -884,33 +780,29 @@ else:
     F0 = float(raw_slope_poly(0.0))
     offset = F0 - 1.0
     coeffs = raw_slope_poly.coefficients.copy()
-    coeffs[-1] -= offset  # корекция на свободния член => F(0)=1
+    coeffs[-1] -= offset
     slope_poly = np.poly1d(coeffs)
     seg_slope = apply_slope_modulation(seg_glide, slope_poly, V_crit)
 
-# 5a) Почистване на v_flat_eq от нереалистични спайкове
+# 5a) Почистване за CS (само клип)
 seg_slope = seg_slope.sort_values(["activity", "t_start"]).reset_index(drop=True)
 for act, g_act in seg_slope.groupby("activity"):
     v_clean = clean_speed_for_cs(g_act, v_max_cs=50.0)
     seg_slope.loc[g_act.index, "v_flat_eq"] = v_clean
-
 
 # 5b) CS модулация върху v_flat_eq
 if do_calibrate:
     k_par = calibrate_k_for_target_t90(CS, ref_percent, tau_min, q_par, target_t90)
     st.sidebar.success(f"Нов k = {k_par:.2f} (приложен)")
 
-# добавяме time_s (кумулативно) по активност
 seg_slope = seg_slope.sort_values(["activity", "t_start"]).reset_index(drop=True)
 seg_slope["time_s"] = seg_slope.groupby("activity")["dt_s"].cumsum() - seg_slope["dt_s"]
 
 cs_rows = []
 for act, g in seg_slope.groupby("activity"):
-    # 1) чистим скоростта: режем над v_max_cs и изглаждаме спайковете
     v_clean = clean_speed_for_cs(g, v_max_cs=50.0)
     dt_arr = g["dt_s"].to_numpy(dtype=float)
 
-    # 2) прилагаме CS модела върху изчистената скорост
     out_cs = apply_cs_modulation(
         v=v_clean,
         dt=dt_arr,
@@ -930,14 +822,13 @@ for act, g in seg_slope.groupby("activity"):
 
 seg_slope_cs = pd.concat(cs_rows, ignore_index=True)
 
-# CS диагностична метрика t90 за референтния сценарий
 dv_ref, tau_ref_now, t90_now = predict_t90_for_reference(CS, ref_percent, tau_min, k_par, q_par)
 st.caption(
     f"CS модел: Δv_ref = {dv_ref:.2f} km/h, τ_ref ≈ {tau_ref_now:.1f} s, "
     f"t₉₀ ≈ {t90_now:.0f} s при {ref_percent:.1f}% от CS."
 )
 
-# 6) Обобщена таблица по активности
+# 6) Обобщение
 summary_df = build_activity_summary(
     segments_f,
     train_glide,
@@ -947,9 +838,44 @@ summary_df = build_activity_summary(
     glide_coeffs
 )
 
-
 st.subheader("Обобщение по активности (след нормализация по наклон и плъзгаемост)")
 st.dataframe(summary_df, use_container_width=True)
+
+# ---------------------------------------------------------
+# ГРАФИКА 0 – Сравнение slope от smooth vs raw (за избрана активност)
+# ---------------------------------------------------------
+st.subheader("Сравнение на slope: от elev_smooth vs от elev_raw (за избрана активност)")
+
+act_list = sorted(seg_slope_cs["activity"].unique())
+act_selected_slope = st.selectbox("Избери активност за slope сравнение:", act_list, key="slope_compare_act")
+
+seg_cmp = segments_f[segments_f["activity"] == act_selected_slope].copy()
+if not seg_cmp.empty:
+    seg_cmp["t_mid"] = seg_cmp["t_start"] + (seg_cmp["t_end"] - seg_cmp["t_start"]) / 2
+    long = seg_cmp[["t_mid", "slope_pct", "slope_raw_pct"]].melt(
+        "t_mid", var_name="series", value_name="slope"
+    )
+    long["series"] = long["series"].map({
+        "slope_pct": "slope from SMOOTH elev",
+        "slope_raw_pct": "slope from RAW elev"
+    })
+
+    ch = alt.Chart(long).mark_line().encode(
+        x=alt.X("t_mid:T", title="time"),
+        y=alt.Y("slope:Q", title="slope (%)"),
+        color=alt.Color("series:N", title=""),
+        tooltip=["t_mid:T", "series:N", alt.Tooltip("slope:Q", format=".2f")]
+    ).interactive()
+    st.altair_chart(ch, use_container_width=True)
+
+    # метрика за разликата
+    diff = seg_cmp["slope_raw_pct"] - seg_cmp["slope_pct"]
+    st.caption(
+        f"Разлика (RAW - SMOOTH) slope: mean |diff| = {diff.abs().mean():.3f} %, "
+        f"max |diff| = {diff.abs().max():.3f} %"
+    )
+else:
+    st.info("Няма сегменти за избраната активност.")
 
 # ---------------------------------------------------------
 # ГРАФИКА 1 – ПЛЪЗГАЕМОСТ: скорост vs наклон
@@ -1013,13 +939,7 @@ else:
 # ---------------------------------------------------------
 st.subheader("CS модулация на еквивалентната скорост (по активности)")
 
-act_list = sorted(seg_slope_cs["activity"].unique())
-act_cs_selected = st.selectbox(
-    "Избери активност за CS-графика:",
-    act_list,
-    key="cs_act_select"
-)
-
+act_cs_selected = st.selectbox("Избери активност за CS-графика:", act_list, key="cs_act_select")
 g_plot = seg_slope_cs[seg_slope_cs["activity"] == act_cs_selected].copy()
 
 if not g_plot.empty:
@@ -1038,8 +958,7 @@ if not g_plot.empty:
 
     st.altair_chart(line_orig + line_cs, use_container_width=True)
 
-    st.caption("Плътна линия – v_flat_eq (само наклон+плъзгаемост); "
-               "пунктирана – v_flat_eq_cs (допълнително CS-модулирана).")
+    st.caption("Плътна линия – v_flat_eq (наклон+плъзгаемост); пунктирана – v_flat_eq_cs (с CS).")
 
 # ---------------------------------------------------------
 # ЗОНИ – СКОРОСТ + ПУЛС (ВСИЧКИ АКТИВНОСТИ)
@@ -1050,7 +969,7 @@ st.subheader("Разпределение по зони – скорост и п�
 zone_table_all = build_zone_speed_hr_table(seg_zones, V_crit, activity=None)
 st.dataframe(zone_table_all, use_container_width=True)
 
-# CS-зони: използваме v_flat_eq_cs като v_flat_eq
+# CS-зони
 seg_slope_cs_for_zones = seg_slope_cs.copy()
 seg_slope_cs_for_zones["v_flat_eq"] = seg_slope_cs_for_zones["v_flat_eq_cs"]
 seg_zones_cs = assign_speed_zones(seg_slope_cs_for_zones, V_crit)
@@ -1064,11 +983,7 @@ st.dataframe(zone_table_all_cs, use_container_width=True)
 # ---------------------------------------------------------
 st.subheader("Разпределение по зони – скорост и пулс (избрана активност)")
 
-act_selected = st.selectbox(
-    "Избери активност за зонен анализ:",
-    act_list,
-    key="zone_act_select"
-)
+act_selected = st.selectbox("Избери активност за зонен анализ:", act_list, key="zone_act_select")
 
 zone_table_act = build_zone_speed_hr_table(seg_zones, V_crit, activity=act_selected)
 st.markdown("**Без CS модулация:**")
@@ -1081,11 +996,12 @@ st.dataframe(zone_table_act_cs, use_container_width=True)
 # ---------------------------------------------------------
 # ЕКСПОРТ НА СЕГМЕНТИТЕ
 # ---------------------------------------------------------
-st.subheader("Експорт на сегментите (след двете модулации + CS)")
+st.subheader("Експорт на сегментите (наклон от elev_smooth + сравнение с raw slope)")
 
 export_cols = [
     "activity", "seg_idx", "t_start", "t_end", "dt_s", "d_m",
-    "slope_pct", "v_kmh", "valid_basic", "speed_spike",
+    "slope_pct", "slope_raw_pct",
+    "v_kmh", "valid_basic", "speed_spike",
     "K_glide", "v_glide",
     "v_flat_eq", "v_flat_eq_cs",
     "time_s",
@@ -1101,6 +1017,6 @@ csv_data = export_df.to_csv(index=False).encode("utf-8")
 st.download_button(
     label="Свали сегментите като CSV",
     data=csv_data,
-    file_name="segments_glide_slope_cs_mod.csv",
+    file_name="segments_glide_slope_cs_mod_smoothElev.csv",
     mime="text/csv"
 )
